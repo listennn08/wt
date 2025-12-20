@@ -1,24 +1,25 @@
 {
   "name": "wt",
   "version": "1.0.0",
-  "description": "",
-  "type": "module",
-  "main": "./dist/index.js",
+  "description": "The git worktree manager",
   "bin": {
-    "wt": "./dist/index.js"
+    "wt": "bin/wt.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -p tsconfig.json -w",
     "dev": "node --enable-source-maps --loader ts-node/esm src/index.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
+  "author": "listennn08@outlook.com",
   "license": "ISC",
   "dependencies": {
+    "chalk": "^5.6.2",
     "commander": "^14.0.0",
+    "local-pkg": "^1.1.2",
     "simple-git": "^3.28.0",
-    "zx": "^8.8.1"
+    "zx": "^8.8.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
