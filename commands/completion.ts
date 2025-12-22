@@ -49,7 +49,7 @@ export class CompletionCommand extends AbstractCommand {
     program.command('__complete-actions', { hidden: true })
       .description('Print actions for shell completion')
       .action(async () => {
-        process.stdout.write(['add', 'list', 'remove', 'prune'].join('\n'));
+        process.stdout.write(['add', 'list', 'remove', 'switch', 'prune', 'uninstall'].join('\n'));
         process.stdout.write('\n');
       });
     program
@@ -205,6 +205,14 @@ complete -c wt -f -n "__fish_seen_subcommand_from remove" -s f -l force -d "Forc
 complete -c wt -f -n "__fish_seen_subcommand_from remove" -s b -l branch -r -a "(__wt_complete_branches)" -d "Treat target as a branch name"
 complete -c wt -f -n "__fish_seen_subcommand_from remove" -s p -l path -r -d "Treat target as a worktree path"
 
+# switch
+complete -c wt -f -n "__fish_seen_subcommand_from switch" -a "(__wt_complete_worktrees)"
+complete -c wt -f -n "__fish_seen_subcommand_from switch" -a "(__wt_complete_branches)"
+complete -c wt -f -n "__fish_seen_subcommand_from switch" -s b -l branch -r -a "(__wt_complete_branches)" -d "Treat target as a branch name"
+complete -c wt -f -n "__fish_seen_subcommand_from switch" -s p -l path -r -d "Treat target as a worktree path"
+complete -c wt -f -n "__fish_seen_subcommand_from switch" -l print -d "Print resolved worktree path only"
+complete -c wt -f -n "__fish_seen_subcommand_from switch" -l shell -r -d "Shell to use"
+
 # prune
 complete -c wt -f -n "__fish_seen_subcommand_from prune" -l dry-run -d "Do not remove anything; show what would be pruned"
 complete -c wt -f -n "__fish_seen_subcommand_from prune" -l verbose -d "Report all removals"
@@ -213,6 +221,10 @@ complete -c wt -f -n "__fish_seen_subcommand_from prune" -l expire -r -d "Expire
 # completion
 complete -c wt -f -n "__fish_seen_subcommand_from completion" -a "zsh fish install"
 complete -c wt -f -n "__fish_seen_subcommand_from completion install" -l shell -r -a "zsh fish" -d "Shell name"
+
+# uninstall
+complete -c wt -f -n "__fish_seen_subcommand_from uninstall" -l shell -r -a "zsh fish all" -d "Shell name"
+complete -c wt -f -n "__fish_seen_subcommand_from uninstall" -l yes -d "Do not prompt"
 `;
   }
 
@@ -224,7 +236,9 @@ complete -c wt -f -n "__fish_seen_subcommand_from completion install" -l shell -
           'add:Add a new worktree from a branch'
           'list:List all worktrees'
           'remove:Delete a worktree'
+          'switch:Switch to a worktree and open a shell in its directory'
           'completion:Shell completion utilities'
+          'uninstall:Remove wt shell completions and print package uninstall instructions'
         )
 
         _arguments -C \
@@ -265,6 +279,15 @@ complete -c wt -f -n "__fish_seen_subcommand_from completion install" -l shell -
               '(-p --path)'{-p,--path}'[Treat target as a worktree path]:path:_files -/'
             return
           ;;
+          (switch)
+            _arguments \
+              '1:target:($(wt __complete-worktrees))' \
+              '(-b --branch)'{-b,--branch}'[Treat target as a branch name]:branch:($(wt __complete-branches))' \
+              '(-p --path)'{-p,--path}'[Treat target as a worktree path]:path:_files -/' \
+              '(--print)--print[Print resolved worktree path only]' \
+              '(--shell)--shell[Shell to use]:shell:'
+            return
+          ;;
           (prune)
             _arguments \
               '(--dry-run)--dry-run[Do not remove anything; show what would be pruned]' \
@@ -275,6 +298,12 @@ complete -c wt -f -n "__fish_seen_subcommand_from completion install" -l shell -
           (completion)
             _arguments \
               '1:subcommand:(zsh fish install)'
+            return
+          ;;
+          (uninstall)
+            _arguments \
+              '(--shell)--shell[Shell name]:shell:(zsh fish all)' \
+              '(--yes)--yes[Do not prompt]'
             return
           ;;
         esac
