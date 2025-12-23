@@ -28,9 +28,16 @@ export class CompletionCommand extends AbstractCommand {
       });
 
     completion
+      .command('bash')
+      .description('Print bash completion script')
+      .action(async () => {
+        process.stdout.write(this.bashCompletionScript());
+      });
+
+    completion
       .command('install')
       .description('Auto-detect shell and install completion')
-      .option('--shell <shell>', 'Shell name (zsh|fish)')
+      .option('--shell <shell>', 'Shell name (zsh|fish|bash)')
       .action(async (options: { shell?: string }) => {
         const shell = (options.shell ?? this.detectShell()).toLowerCase();
         if (shell === 'zsh') {
@@ -42,14 +49,19 @@ export class CompletionCommand extends AbstractCommand {
           return;
         }
 
-        console.error('Only zsh and fish completion are supported');
+        if (shell === 'bash') {
+          this.installBashCompletion();
+          return;
+        }
+
+        console.error('Only zsh, fish, and bash completion are supported');
         process.exit(1);
       });
 
     program.command('__complete-actions', { hidden: true })
       .description('Print actions for shell completion')
       .action(async () => {
-        process.stdout.write(['add', 'list', 'remove', 'switch', 'prune', 'uninstall'].join('\n'));
+        process.stdout.write(['add', 'list', 'remove', 'switch', 'tui', 'prune', 'uninstall'].join('\n'));
         process.stdout.write('\n');
       });
     program
@@ -166,6 +178,41 @@ export class CompletionCommand extends AbstractCommand {
     process.stdout.write(`Reload fish (new shell) or run:\n- source ${completionFile}\n`);
   }
 
+  private installBashCompletion(): void {
+    const home = os.homedir();
+    const completionDir = path.join(home, '.bash_completion.d');
+    const completionFile = path.join(completionDir, 'wt');
+    const bashrcPath = path.join(home, '.bashrc');
+
+    fs.mkdirSync(completionDir, { recursive: true });
+    fs.writeFileSync(completionFile, this.bashCompletionScript(), { encoding: 'utf8' });
+
+    const startMarker = '# wt completion start';
+    const endMarker = '# wt completion end';
+    const block = [
+      startMarker,
+      `source "${completionFile}"`,
+      endMarker,
+      '',
+    ].join('\n');
+
+    let existing = '';
+    if (fs.existsSync(bashrcPath)) {
+      existing = fs.readFileSync(bashrcPath, 'utf8');
+    }
+
+    const hasMarker = existing.includes(startMarker) || existing.includes(endMarker);
+    const hasSource = existing.includes(`source "${completionFile}"`) || existing.includes(`. "${completionFile}"`);
+
+    if (!hasMarker && !hasSource) {
+      const next = existing.length > 0 && !existing.endsWith('\n') ? existing + '\n' : existing;
+      fs.writeFileSync(bashrcPath, next + '\n' + block, { encoding: 'utf8' });
+    }
+
+    process.stdout.write(`Installed bash completion:\n- ${completionFile}\n`);
+    process.stdout.write(`Reload your shell:\n- source ~/.bashrc\n`);
+  }
+
   private fishCompletionScript(): string {
     return `# fish completion for wt
 
@@ -213,18 +260,60 @@ complete -c wt -f -n "__fish_seen_subcommand_from switch" -s p -l path -r -d "Tr
 complete -c wt -f -n "__fish_seen_subcommand_from switch" -l print -d "Print resolved worktree path only"
 complete -c wt -f -n "__fish_seen_subcommand_from switch" -l shell -r -d "Shell to use"
 
+# tui
+complete -c wt -f -n "__fish_seen_subcommand_from tui" -d "Interactive TUI for worktrees"
+
 # prune
 complete -c wt -f -n "__fish_seen_subcommand_from prune" -l dry-run -d "Do not remove anything; show what would be pruned"
 complete -c wt -f -n "__fish_seen_subcommand_from prune" -l verbose -d "Report all removals"
 complete -c wt -f -n "__fish_seen_subcommand_from prune" -l expire -r -d "Expire worktrees older than <time>"
 
 # completion
-complete -c wt -f -n "__fish_seen_subcommand_from completion" -a "zsh fish install"
-complete -c wt -f -n "__fish_seen_subcommand_from completion install" -l shell -r -a "zsh fish" -d "Shell name"
+complete -c wt -f -n "__fish_seen_subcommand_from completion" -a "zsh fish bash install"
+complete -c wt -f -n "__fish_seen_subcommand_from completion install" -l shell -r -a "zsh fish bash" -d "Shell name"
 
 # uninstall
 complete -c wt -f -n "__fish_seen_subcommand_from uninstall" -l shell -r -a "zsh fish all" -d "Shell name"
 complete -c wt -f -n "__fish_seen_subcommand_from uninstall" -l yes -d "Do not prompt"
+`;
+  }
+
+  private bashCompletionScript(): string {
+    return `# bash completion for wt
+
+_wt()
+{
+  local cur prev words cword
+  _init_completion -n : || return
+
+  if [[ $cword -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "$(wt __complete-actions)" -- "$cur") )
+    return
+  fi
+
+  local cmd=\${words[1]}
+  case "$cmd" in
+    add)
+      COMPREPLY=( $(compgen -W "$(wt __complete-branches)" -- "$cur") )
+      return
+      ;;
+    remove|switch)
+      COMPREPLY=( $(compgen -W "$(wt __complete-worktrees)\n$(wt __complete-branches)" -- "$cur") )
+      return
+      ;;
+    completion)
+      if [[ $cword -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "zsh fish bash install" -- "$cur") )
+        return
+      fi
+      return
+      ;;
+  esac
+}
+
+if declare -F complete >/dev/null 2>&1; then
+  complete -F _wt wt
+fi
 `;
   }
 
@@ -237,6 +326,7 @@ complete -c wt -f -n "__fish_seen_subcommand_from uninstall" -l yes -d "Do not p
           'list:List all worktrees'
           'remove:Delete a worktree'
           'switch:Switch to a worktree and open a shell in its directory'
+          'tui:Interactive TUI for worktrees'
           'completion:Shell completion utilities'
           'uninstall:Remove wt shell completions and print package uninstall instructions'
         )
@@ -288,6 +378,10 @@ complete -c wt -f -n "__fish_seen_subcommand_from uninstall" -l yes -d "Do not p
               '(--shell)--shell[Shell to use]:shell:'
             return
           ;;
+          (tui)
+            _arguments
+            return
+          ;;
           (prune)
             _arguments \
               '(--dry-run)--dry-run[Do not remove anything; show what would be pruned]' \
@@ -297,7 +391,7 @@ complete -c wt -f -n "__fish_seen_subcommand_from uninstall" -l yes -d "Do not p
           ;;
           (completion)
             _arguments \
-              '1:subcommand:(zsh fish install)'
+              '1:subcommand:(zsh fish bash install)'
             return
           ;;
           (uninstall)

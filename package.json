@@ -2,31 +2,16 @@
   "name": "wt",
   "version": "1.0.0",
   "description": "The git worktree manager",
-  "bin": {
-    "wt": "bin/wt.js"
-  },
+  "private": true,
   "scripts": {
-    "prepare": "pnpm build",
-    "build": "tsc -p tsconfig.json",
-    "build:watch": "tsc -p tsconfig.json -w",
-    "dev": "node --enable-source-maps --loader ts-node/esm src/index.ts",
-    "prepack": "pnpm build",
+    "build": "pnpm -r build",
+    "build:watch": "pnpm -r build:watch",
+    "dev": "pnpm --filter @wt/tui dev",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "listennn08@outlook.com",
   "license": "ISC",
-  "dependencies": {
-    "chalk": "^5.6.2",
-    "commander": "^14.0.0",
-    "local-pkg": "^1.1.2",
-    "simple-git": "^3.28.0",
-    "zx": "^8.8.5"
-  },
-  "devDependencies": {
-    "@types/node": "^24.0.0",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.0"
-  },
+  "devDependencies": {},
   "packageManager": "pnpm@10.26.1"
 }

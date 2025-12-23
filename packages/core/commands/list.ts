@@ -2,6 +2,8 @@ import { AbstractCommand } from "./base";
 import { SimpleGit } from "simple-git";
 import { Command } from "commander";
 import { WorktreeInfo } from "../types";
+import path from 'path';
+import chalk from 'chalk';
 
 export class ListCommand extends AbstractCommand {
   constructor(protected git: SimpleGit) { super(git) }
