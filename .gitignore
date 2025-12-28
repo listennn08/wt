@@ -6,3 +6,5 @@ commands/**/*.js
 commands/**/*.d.ts
 utils/**/*.js
 utils/**/*.d.ts
+**/*.js
+**/target/*

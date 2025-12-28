@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import { spawn } from 'child_process';
 import { createRequire } from 'module';
+import path from 'path';
 import { SimpleGit } from 'simple-git';
 import { AbstractCommand } from './base';
 
@@ -17,16 +18,18 @@ export class TuiCommand extends AbstractCommand {
   }
 
   private async runTui(): Promise<void> {
-    const require = createRequire(__filename);
-    const cliPath = require.resolve('@wt/tui/dist/cli.js');
+    const rustTuiPath = path.resolve(__dirname, '..', '..', '..', 'tui-rust', 'target', 'release', 'wt-tui');
 
-    const child = spawn(process.execPath, [cliPath], {
-      cwd: process.cwd(),
+    let repoRoot = process.cwd();
+    try {
+      repoRoot = (await this.git.revparse(['--show-toplevel'])).trim();
+    } catch (err) {
+      // fall back to current directory
+    }
+
+    const child = spawn(rustTuiPath, ['--repo', repoRoot], {
+      cwd: repoRoot,
       stdio: 'inherit',
-      env: {
-        ...process.env,
-        WT_BASE_CWD: process.cwd(),
-      },
     });
 
     child.on('exit', (code) => {
@@ -34,7 +37,8 @@ export class TuiCommand extends AbstractCommand {
     });
 
     child.on('error', (err) => {
-      console.error(String(err));
+      console.error(`Failed to launch TUI: ${err.message}`);
+      console.error('Make sure the Rust TUI is built: cd packages/tui-rust && cargo build --release');
       process.exit(1);
     });
   }

@@ -42,7 +42,7 @@ export class ListCommand extends AbstractCommand {
         }
         if (line.startsWith('branch ')) {
           const ref = line.slice('branch '.length).trim();
-          wt.branch = ref.replace(/^refs\//, '');
+          wt.branch = ref.replace(/^refs\/heads\//, '');
           wt.detached = false;
           continue;
         }
@@ -136,7 +136,7 @@ export class ListCommand extends AbstractCommand {
       Math.max('BRANCH'.length, ...rows.map((r) => r.branch.length)),
     );
   
-    const header = `${this.pad('PATH', pathWidth)}  ${this.pad('BRANCH', branchWidth)}  ${this.pad('HEAD', 8)}  FLAGS`;
+    const header = `${this.pad('BRANCH', branchWidth)}  ${this.pad('PATH', pathWidth)}  ${this.pad('HEAD', 8)}  FLAGS`;
     process.stdout.write(chalk.bold(chalk.gray(header)) + '\n');
   
     for (const r of rows) {
@@ -159,7 +159,7 @@ export class ListCommand extends AbstractCommand {
         })
         .join(chalk.gray(','));
   
-      const line = `${pathCol}  ${branchCol}  ${headCol}  ${flagsCol}`;
+      const line = `${branchCol}  ${pathCol}  ${headCol}  ${flagsCol}`;
       process.stdout.write(r.isBase ? chalk.bold(line) + '\n' : line + '\n');
     }
   }
