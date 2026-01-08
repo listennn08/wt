@@ -18,7 +18,7 @@ export class TuiCommand extends AbstractCommand {
   }
 
   private async runTui(): Promise<void> {
-    const rustTuiPath = path.resolve(__dirname, '..', '..', '..', 'tui-rust', 'target', 'release', 'wt-tui');
+    const rustTuiPath = path.resolve(__dirname, '..', '..', '..', 'tui', 'target', 'release', 'wt-tui');
 
     let repoRoot = process.cwd();
     try {

@@ -2,12 +2,103 @@ import { Command } from "commander";
 import fs from 'fs';
 import path from 'path';
 import chalk from 'chalk';
+import os from 'os';
+import { spawn } from 'child_process';
 import { SimpleGit } from "simple-git";
-import { dependenciesInstalled, detectPackageManager, installCommandString, runInstall } from "../utils/packageManager";
+import * as toml from '@iarna/toml';
 import  { AbstractCommand } from "./base";
+
+type HookCommand = {
+  program: string;
+  args?: string[];
+  cwd?: string;
+};
+
+type WtConfig = {
+  hooks?: {
+    add?: {
+      pre_create?: HookCommand[];
+      post_create?: HookCommand[];
+      disable_default_post_create?: boolean;
+    };
+  };
+};
 
 export class AddCommand extends AbstractCommand {
   constructor(protected git: SimpleGit) { super(git); }
+
+  private readConfigIfExists(filePath: string): WtConfig | null {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf8');
+    try {
+      return toml.parse(content) as unknown as WtConfig;
+    } catch (err: any) {
+      throw new Error(`Failed to parse config ${filePath}: ${err?.message ?? String(err)}`);
+    }
+  }
+
+  private loadConfig(baseTop: string): WtConfig {
+    const candidates: string[] = [
+      path.join(baseTop, '.wt.toml'),
+      path.join(baseTop, 'wt.toml'),
+      path.join(baseTop, '.config', 'wt', 'config.toml'),
+    ];
+
+    const xdg = process.env.XDG_CONFIG_HOME;
+    if (xdg) {
+      candidates.push(path.join(xdg, 'wt', 'config.toml'));
+    } else {
+      candidates.push(path.join(os.homedir(), '.config', 'wt', 'config.toml'));
+    }
+
+    for (const p of candidates) {
+      const cfg = this.readConfigIfExists(p);
+      if (cfg) return cfg;
+    }
+    return {};
+  }
+
+  private async runHookCommands(
+    hookName: string,
+    commands: HookCommand[] | undefined,
+    ctx: { baseTop: string; worktreePath: string; branch: string },
+  ): Promise<void> {
+    if (!commands || commands.length === 0) return;
+
+    for (const cmd of commands) {
+      const args = cmd.args ?? [];
+
+      const cwd = (() => {
+        if (!cmd.cwd) return ctx.baseTop;
+        if (cmd.cwd === '${base}') return ctx.baseTop;
+        if (cmd.cwd === '${worktree}') return ctx.worktreePath;
+        return cmd.cwd;
+      })();
+
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(cmd.program, args, {
+          cwd,
+          stdio: 'inherit',
+          env: {
+            ...process.env,
+            WT_BASE: ctx.baseTop,
+            WT_WORKTREE: ctx.worktreePath,
+            WT_BRANCH: ctx.branch,
+          },
+        });
+
+        child.on('error', (err) => {
+          reject(new Error(`Hook ${hookName} failed to start: ${cmd.program}: ${err.message}`));
+        });
+
+        child.on('exit', (code) => {
+          if (code === 0) return resolve();
+          const cmdline = [cmd.program, ...args].join(' ');
+          reject(new Error(`Hook ${hookName} failed: cmd='${cmdline}' cwd='${cwd}' exitCode=${code ?? 'null'}`));
+        });
+      });
+    }
+  }
 
   public load(program: Command): void {
     program
@@ -60,6 +151,14 @@ export class AddCommand extends AbstractCommand {
     const remote = opts.remote ?? 'origin';
     const baseTop = (await this.git.revparse(['--show-toplevel'])).trim();
     const worktreePath = opts.dir ? path.resolve(opts.dir) : path.resolve(await this.defaultWorktreeDir(branch));
+
+    const cfg = this.loadConfig(baseTop);
+    const addHooks = cfg.hooks?.add;
+    await this.runHookCommands('hooks.add.pre_create', addHooks?.pre_create, {
+      baseTop,
+      worktreePath,
+      branch,
+    });
   
     if (fs.existsSync(worktreePath) && !opts.force) {
       console.warn(chalk.yellow`Target path already exists: ` + chalk.yellow(worktreePath));
@@ -73,7 +172,14 @@ export class AddCommand extends AbstractCommand {
     if (localExists) {
       this.log(`worktree add (existing local branch): ${branch}`);
       await this.git.raw(['worktree', 'add', worktreePath, branch]);
-      await this.postCreate(baseTop, worktreePath, opts);
+      if (!addHooks?.disable_default_post_create) {
+        await this.postCreate(baseTop, worktreePath, opts);
+      }
+      await this.runHookCommands('hooks.add.post_create', addHooks?.post_create, {
+        baseTop,
+        worktreePath,
+        branch,
+      });
       this.log(worktreePath);
       return;
     }
@@ -81,7 +187,14 @@ export class AddCommand extends AbstractCommand {
     if (remoteExists && !opts.newBranch) {
       this.log(`worktree add (from remote ${remote}/${branch}): ${branch}`);
       await this.git.raw(['worktree', 'add', '-b', branch, worktreePath, `${remote}/${branch}`]);
-      await this.postCreate(baseTop, worktreePath, opts);
+      if (!addHooks?.disable_default_post_create) {
+        await this.postCreate(baseTop, worktreePath, opts);
+      }
+      await this.runHookCommands('hooks.add.post_create', addHooks?.post_create, {
+        baseTop,
+        worktreePath,
+        branch,
+      });
       this.log(worktreePath);
       return;
     }
@@ -90,28 +203,19 @@ export class AddCommand extends AbstractCommand {
     const base = opts.base ?? (currentBranch || 'HEAD');
     this.log(`worktree add (new branch from ${base}): ${branch}`);
     await this.git.raw(['worktree', 'add', '-b', branch, worktreePath, base]);
-    await this.postCreate(baseTop, worktreePath, opts);
+    if (!addHooks?.disable_default_post_create) {
+      await this.postCreate(baseTop, worktreePath, opts);
+    }
+    await this.runHookCommands('hooks.add.post_create', addHooks?.post_create, {
+      baseTop,
+      worktreePath,
+      branch,
+    });
     this.log(worktreePath);
   }
 
   private async postCreate(baseTop: string, worktreePath: string, opts: { install?: boolean }) {
     this.copyEnvFiles(baseTop, worktreePath);
-
-    const pm = detectPackageManager(worktreePath);
-    if (!pm) return;
-
-    if (dependenciesInstalled(worktreePath)) return;
-
-    const cmd = installCommandString(pm);
-    if (opts.install !== false) {
-      this.log(`Installing deps: ${cmd}`);
-      await runInstall(pm, worktreePath);
-      this.log(`deps installed`);
-      return;
-    }
-
-    console.info(chalk.red`Dependencies not installed in: ${worktreePath}`);
-    console.info(chalk.yellow`Run: (cd ${worktreePath} && ${cmd})`);
   }
 
   private async repoName(): Promise<string> {
