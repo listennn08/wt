@@ -108,6 +108,12 @@ impl App {
             // Draw the UI
             terminal.draw(|f| draw::<B>(f, self))?;
 
+            // If the shell exited while focused on the terminal, switch focus back
+            // to the list to avoid a "dead" terminal pane capturing input.
+            if self.focus == Focus::Terminal && self.terminal_manager.is_disconnected() {
+                self.focus = Focus::List;
+            }
+
             self.process_pending_action();
 
             // Handle events
@@ -161,6 +167,10 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('g') => self.refresh_worktrees(),
             KeyCode::Char('r') => self.confirm_remove_selected(),
+            KeyCode::Char('R') => {
+                self.terminal_manager.restart();
+                self.focus = Focus::Terminal;
+            }
             KeyCode::Char('a') => self.open_add_modal(),
             KeyCode::Char('x') => self.confirm_prune_worktrees(),
             KeyCode::Up => {
@@ -189,6 +199,9 @@ impl App {
             KeyCode::Esc => self.focus = Focus::List,
             KeyCode::BackTab => self.focus = Focus::List,
             KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => self.focus = Focus::List,
+            KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.terminal_manager.restart();
+            }
             _ => {
                 // Send key to terminal
                 if let Some(input) = self.key_to_ansi(key_code, modifiers) {

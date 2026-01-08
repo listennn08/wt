@@ -11,11 +11,12 @@ use vt100::Cell;
 pub struct TerminalManager {
     pty_system: Box<dyn PtySystem + Send>,
     pty_pair: Option<PtyPair>,
-    child_process: Option<Box<dyn portable_pty::Child + Send>>,
+    child_process: Arc<Mutex<Option<Box<dyn portable_pty::Child + Send>>>>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     current_dir: Arc<Mutex<String>>,
     parser: Arc<Mutex<Parser>>,
     is_alive: Arc<Mutex<bool>>,
+    disconnected: Arc<Mutex<bool>>,
 }
 
 impl TerminalManager {
@@ -26,12 +27,25 @@ impl TerminalManager {
         Ok(Self {
             pty_system,
             pty_pair: None,
-            child_process: None,
+            child_process: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
             current_dir: Arc::new(Mutex::new(std::env::current_dir()?.to_string_lossy().to_string())),
             parser: Arc::new(Mutex::new(parser)),
             is_alive: Arc::new(Mutex::new(false)),
+            disconnected: Arc::new(Mutex::new(false)),
         })
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        *self.disconnected.lock().unwrap()
+    }
+
+    pub fn restart(&mut self) {
+        *self.disconnected.lock().unwrap() = false;
+        *self.is_alive.lock().unwrap() = false;
+        *self.writer.lock().unwrap() = None;
+        *self.child_process.lock().unwrap() = None;
+        self.pty_pair = None;
     }
 
     pub fn change_directory(&mut self, dir: &str) {
@@ -54,6 +68,15 @@ impl TerminalManager {
     pub async fn update(&mut self) -> Result<()> {
         // Start terminal if not alive
         if !*self.is_alive.lock().unwrap() {
+            // If the user exited the shell, keep the terminal disconnected until
+            // explicitly restarted.
+            if *self.disconnected.lock().unwrap() {
+                return Ok(());
+            }
+            // Clean up any stale handles from a previously exited shell.
+            // (Best-effort; most OS resources are freed when the child exits.)
+            *self.writer.lock().unwrap() = None;
+            *self.child_process.lock().unwrap() = None;
             self.start_terminal()?;
         }
         Ok(())
@@ -87,7 +110,43 @@ impl TerminalManager {
         }
 
         let child = pty_pair.slave.spawn_command(cmd)?;
+
+        // Store child so we can manage lifecycle (and allow a watcher thread to wait).
+        {
+            let mut guard = self.child_process.lock().unwrap();
+            *guard = Some(child);
+        }
+
         *self.is_alive.lock().unwrap() = true;
+        *self.disconnected.lock().unwrap() = false;
+
+        // Watcher thread: if the shell exits (e.g. user types `exit`), mark
+        // the session as dead so update() can restart it.
+        {
+            let child_process = self.child_process.clone();
+            let is_alive = self.is_alive.clone();
+            let writer = self.writer.clone();
+            let disconnected = self.disconnected.clone();
+            let parser = self.parser.clone();
+            thread::spawn(move || {
+                let child = {
+                    let mut guard = child_process.lock().unwrap();
+                    guard.take()
+                };
+                if let Some(mut child) = child {
+                    let _ = child.wait();
+                }
+                *is_alive.lock().unwrap() = false;
+                *disconnected.lock().unwrap() = true;
+                *writer.lock().unwrap() = None;
+
+                // Best-effort message into the terminal buffer so the user knows
+                // what happened and how to recover.
+                if let Ok(mut p) = parser.lock() {
+                    p.process(b"\r\n[Shell exited. Press Ctrl+R (or Shift+R in list) to restart]\r\n");
+                }
+            });
+        }
 
         // Take the writer ONCE and store it.
         {
@@ -174,7 +233,6 @@ impl TerminalManager {
         });
 
         self.pty_pair = Some(pty_pair);
-        self.child_process = Some(child);
 
         Ok(())
     }
