@@ -1,10 +1,4 @@
 node_modules/
 dist/
-bin/**/*.js
-bin/**/*.d.ts
-commands/**/*.js
-commands/**/*.d.ts
-utils/**/*.js
-utils/**/*.d.ts
-**/*.js
 **/target/*
+listennn08-wt-*-*.tgz

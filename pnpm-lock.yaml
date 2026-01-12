@@ -36,6 +36,8 @@ importers:
         specifier: ^5.9.0
         version: 5.9.3
 
+  packages/tui: {}
+
 packages:
 
   '@iarna/toml@2.2.5':

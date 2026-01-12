@@ -1,6 +1,5 @@
 import { Command } from 'commander';
 import { spawn } from 'child_process';
-import { createRequire } from 'module';
 import path from 'path';
 import { SimpleGit } from 'simple-git';
 import { AbstractCommand } from './base';
@@ -18,7 +17,7 @@ export class TuiCommand extends AbstractCommand {
   }
 
   private async runTui(): Promise<void> {
-    const rustTuiPath = path.resolve(__dirname, '..', '..', '..', 'tui', 'target', 'release', 'wt-tui');
+    const repoRustTuiPath = path.resolve(__dirname, '..', '..', '..', 'tui', 'target', 'release', 'wt-tui');
 
     let repoRoot = process.cwd();
     try {
@@ -27,7 +26,8 @@ export class TuiCommand extends AbstractCommand {
       // fall back to current directory
     }
 
-    const child = spawn(rustTuiPath, ['--repo', repoRoot], {
+    const args = ['--repo', repoRoot];
+    const child = spawn('wt-tui', args, {
       cwd: repoRoot,
       stdio: 'inherit',
     });
@@ -37,9 +37,25 @@ export class TuiCommand extends AbstractCommand {
     });
 
     child.on('error', (err) => {
-      console.error(`Failed to launch TUI: ${err.message}`);
-      console.error('Make sure the Rust TUI is built: cd packages/tui-rust && cargo build --release');
-      process.exit(1);
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.error(`Failed to launch TUI: ${err.message}`);
+        process.exit(1);
+      }
+
+      const fallback = spawn(repoRustTuiPath, args, {
+        cwd: repoRoot,
+        stdio: 'inherit',
+      });
+
+      fallback.on('exit', (code) => {
+        process.exit(code ?? 0);
+      });
+
+      fallback.on('error', (fallbackErr) => {
+        console.error(`Failed to launch TUI: ${fallbackErr.message}`);
+        console.error('Make sure the Rust TUI is installed or built: npm i -g @listennn08/wt-tui OR cd packages/tui && cargo build --release');
+        process.exit(1);
+      });
     });
   }
 }

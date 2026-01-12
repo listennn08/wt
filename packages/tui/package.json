@@ -1,0 +1,22 @@
+{
+  "name": "@listennn08/wt-tui",
+  "version": "1.0.0",
+  "description": "Rust TUI for wt",
+  "type": "commonjs",
+  "files": [
+    "bin",
+    "scripts",
+    "src",
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
+  "bin": {
+    "wt-tui": "bin/wt-tui.cjs"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.cjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
