@@ -50,19 +50,25 @@ pub fn run(args: CompletionArgs) -> Result<()> {
 }
 
 pub fn complete_branches() -> Result<()> {
-    let repo = GitRepo::open(&std::env::current_dir()?)?;
-    let branches = repo.list_branches()?;
-    for b in branches {
-        println!("{}", b);
+    let Ok(repo) = GitRepo::open(&std::env::current_dir()?) else {
+        return Ok(()); // silently return empty when not in a git repo
+    };
+    if let Ok(branches) = repo.list_branches() {
+        for b in branches {
+            println!("{}", b);
+        }
     }
     Ok(())
 }
 
 pub fn complete_worktrees() -> Result<()> {
-    let repo = GitRepo::open(&std::env::current_dir()?)?;
-    let paths = repo.list_worktree_paths()?;
-    for p in paths {
-        println!("{}", p);
+    let Ok(repo) = GitRepo::open(&std::env::current_dir()?) else {
+        return Ok(());
+    };
+    if let Ok(paths) = repo.list_worktree_paths() {
+        for p in paths {
+            println!("{}", p);
+        }
     }
     Ok(())
 }

@@ -1,8 +1,8 @@
 mod cmd;
 mod output;
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 
 #[derive(Parser)]
 #[command(name = "wt", about = "Git worktree manager", version)]
@@ -41,10 +41,10 @@ enum Commands {
     CompleteActions,
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Add(args) => cmd::add::run(args),
         Commands::List(args) => cmd::list::run(args),
         Commands::Remove(args) => cmd::remove::run(args),
@@ -56,5 +56,16 @@ fn main() -> Result<()> {
         Commands::CompleteBranches => cmd::completion::complete_branches(),
         Commands::CompleteWorktrees => cmd::completion::complete_worktrees(),
         Commands::CompleteActions => { cmd::completion::complete_actions(); Ok(()) }
+    };
+
+    if let Err(err) = result {
+        let msg = format!("{}", err);
+        // Friendly message for common errors
+        if msg.contains("Not a git repository") || msg.contains("could not find repository") {
+            eprintln!("{} not a git repository (run this inside a git project)", "error:".red().bold());
+        } else {
+            eprintln!("{} {}", "error:".red().bold(), msg);
+        }
+        std::process::exit(1);
     }
 }
