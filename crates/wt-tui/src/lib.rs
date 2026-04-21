@@ -1,1 +1,3 @@
-// Placeholder — will be implemented in a later task.
+pub mod app;
+pub mod terminal;
+pub mod ui;

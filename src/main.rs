@@ -25,6 +25,8 @@ enum Commands {
     Switch(cmd::switch::SwitchArgs),
     /// Prune stale worktree information
     Prune(cmd::prune::PruneArgs),
+    /// Interactive TUI for worktrees
+    Tui(cmd::tui::TuiArgs),
     /// Remove wt shell completions and print uninstall instructions
     Uninstall(cmd::uninstall::UninstallArgs),
 }
@@ -38,6 +40,7 @@ fn main() -> Result<()> {
         Commands::Remove(args) => cmd::remove::run(args),
         Commands::Switch(args) => cmd::switch::run(args),
         Commands::Prune(args) => cmd::prune::run(args),
+        Commands::Tui(args) => cmd::tui::run(args),
         Commands::Uninstall(args) => cmd::uninstall::run(args),
     }
 }
