@@ -1,9 +1,0 @@
-node_modules/
-dist/
-bin/**/*.js
-bin/**/*.d.ts
-commands/**/*.js
-commands/**/*.d.ts
-utils/**/*.js
-utils/**/*.d.ts
-listennn08-wt-core-*.tgz
