@@ -2,6 +2,7 @@ use std::io;
 
 use anyhow::Result;
 use clap::Args;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,7 +24,7 @@ pub fn run(args: TuiArgs) -> Result<()> {
     rt.block_on(async {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -31,7 +32,7 @@ pub fn run(args: TuiArgs) -> Result<()> {
         let res = app.run(&mut terminal).await;
 
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
 
         if let Err(err) = res {

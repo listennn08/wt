@@ -1,7 +1,11 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{backend::Backend, Terminal};
 
 use wt_core::git::GitRepo;
@@ -25,6 +29,8 @@ pub struct App {
     error_message: Option<String>,
     pending_action: Option<PendingAction>,
     confirm_dialog: Option<ConfirmDialog>,
+    _watcher: Option<RecommendedWatcher>,
+    git_changed_rx: mpsc::Receiver<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +85,29 @@ impl App {
             .map(|wt| wt.path.clone())
             .unwrap_or_else(|| base_path.clone());
 
+        // Set up file watcher for git state changes
+        let (tx, rx) = mpsc::channel();
+        let git_dir = PathBuf::from(&base_path).join(".git");
+
+        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(ev) = res {
+                let dominated = ev.paths.iter().any(|p| {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    name == "HEAD" || name == "FETCH_HEAD" || p.to_string_lossy().contains("refs")
+                });
+                if dominated {
+                    let _ = tx.send(());
+                }
+            }
+        });
+
+        let watcher = if let Ok(mut w) = watcher {
+            let _ = w.watch(&git_dir, RecursiveMode::Recursive);
+            Some(w)
+        } else {
+            None
+        };
+
         Ok(Self {
             repo,
             worktrees,
@@ -94,6 +123,8 @@ impl App {
             error_message: None,
             pending_action: None,
             confirm_dialog: None,
+            _watcher: watcher,
+            git_changed_rx: rx,
         })
     }
 
@@ -110,17 +141,48 @@ impl App {
 
             self.process_pending_action();
 
+            // Refresh worktree list when git state changes
+            if self.git_changed_rx.try_recv().is_ok() {
+                // Drain any extra pending signals
+                while self.git_changed_rx.try_recv().is_ok() {}
+                self.refresh_worktrees();
+            }
+
             // Handle events
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    self.handle_key(key.code, key.modifiers);
+            if event::poll(Duration::from_millis(16))? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        // Any keypress in terminal scrollback → snap back to live
+                        if self.focus == Focus::Terminal && self.terminal_manager.is_scrolled_back() {
+                            self.terminal_manager.scroll_down(usize::MAX);
+                        }
+                        self.handle_key(key.code, key.modifiers);
+                    }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            if self.focus == Focus::Terminal {
+                                self.terminal_manager.scroll_up(3);
+                            } else if self.selected_index > 0 {
+                                self.selected_index -= 1;
+                                self.update_terminal_for_selection();
+                            }
+                        }
+                        MouseEventKind::ScrollDown => {
+                            if self.focus == Focus::Terminal {
+                                self.terminal_manager.scroll_down(3);
+                            } else if self.selected_index < self.worktrees.len().saturating_sub(1) {
+                                self.selected_index += 1;
+                                self.update_terminal_for_selection();
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
 
-            // Update terminal if focused
-            if self.focus == Focus::Terminal {
-                self.terminal_manager.update().await?;
-            }
+            // Always keep terminal alive (even when list is focused)
+            self.terminal_manager.update().await?;
 
             if self.should_quit {
                 break;
@@ -205,6 +267,8 @@ impl App {
         }
     }
 
+
+
     fn key_to_ansi(&self, key_code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
         match key_code {
             KeyCode::Enter => Some("\r".to_string()),
@@ -218,6 +282,8 @@ impl App {
             KeyCode::Left => Some("\x1b[D".to_string()),
             KeyCode::Home => Some("\x1b[H".to_string()),
             KeyCode::End => Some("\x1b[F".to_string()),
+            KeyCode::PageUp => Some("\x1b[5~".to_string()),
+            KeyCode::PageDown => Some("\x1b[6~".to_string()),
             KeyCode::Char(c) => {
                 if modifiers.contains(KeyModifiers::CONTROL) {
                     // Ctrl+key

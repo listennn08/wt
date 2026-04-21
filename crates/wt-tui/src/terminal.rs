@@ -17,6 +17,10 @@ pub struct TerminalManager {
     parser: Arc<Mutex<Parser>>,
     is_alive: Arc<Mutex<bool>>,
     disconnected: Arc<Mutex<bool>>,
+    /// Raw output bytes accumulated from PTY (for scrollback re-rendering)
+    raw_output: Arc<Mutex<Vec<u8>>>,
+    /// Scroll offset (0 = live view, >0 = scrolled back)
+    scroll_offset: usize,
 }
 
 impl TerminalManager {
@@ -33,6 +37,8 @@ impl TerminalManager {
             parser: Arc::new(Mutex::new(parser)),
             is_alive: Arc::new(Mutex::new(false)),
             disconnected: Arc::new(Mutex::new(false)),
+            raw_output: Arc::new(Mutex::new(Vec::new())),
+            scroll_offset: 0,
         })
     }
 
@@ -55,14 +61,25 @@ impl TerminalManager {
         // echo `cd` lines into the UI. This path only affects the next PTY start.
     }
 
-    pub fn send_input(&self, input: &str) {
-        // NOTE: writer is taken once at terminal start and stored.
-        // Best-effort no-op if terminal isn't started yet.
+    pub fn send_input(&mut self, input: &str) {
+        self.scroll_offset = 0;
         let mut guard = self.writer.lock().unwrap();
         if let Some(writer) = guard.as_mut() {
             let _ = writer.write_all(input.as_bytes());
             let _ = writer.flush();
         }
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.scroll_offset += lines;
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn is_scrolled_back(&self) -> bool {
+        self.scroll_offset > 0
     }
 
     pub async fn update(&mut self) -> Result<()> {
@@ -156,6 +173,7 @@ impl TerminalManager {
 
         let mut reader = pty_pair.master.try_clone_reader()?;
         let parser = self.parser.clone();
+        let raw_output = self.raw_output.clone();
 
         // Reader thread to capture output
         thread::spawn(move || {
@@ -224,6 +242,7 @@ impl TerminalManager {
                         if cleaned.is_empty() {
                             continue;
                         }
+                        raw_output.lock().unwrap().extend_from_slice(&cleaned);
                         let mut parser = parser.lock().unwrap();
                         parser.process(&cleaned);
                     }
@@ -268,20 +287,83 @@ impl TerminalManager {
         let mut parser = self.parser.lock().unwrap();
         parser.set_size(rows, cols);
 
-        let screen = parser.screen();
+        if self.scroll_offset == 0 {
+            // Live view — just return visible screen
+            let screen = parser.screen();
+            let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows as usize);
+            for r in 0..rows {
+                let mut row: Vec<Cell> = Vec::with_capacity(cols as usize);
+                for c in 0..cols {
+                    let cell = screen.cell(r, c).cloned().unwrap_or_default();
+                    row.push(cell);
+                }
+                out.push(row);
+            }
+            return out;
+        }
+
+        // Scrollback view — re-render all raw output into a tall virtual terminal,
+        // then pick a window offset from the bottom.
+        let raw = self.raw_output.lock().unwrap();
+        if raw.is_empty() {
+            // Nothing to scroll back to
+            let screen = parser.screen();
+            let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows as usize);
+            for r in 0..rows {
+                let mut row: Vec<Cell> = Vec::with_capacity(cols as usize);
+                for c in 0..cols {
+                    let cell = screen.cell(r, c).cloned().unwrap_or_default();
+                    row.push(cell);
+                }
+                out.push(row);
+            }
+            return out;
+        }
+
+        // Use a large virtual terminal to hold all output
+        let tall_rows = 5000u16; // max scrollback lines
+        let mut tmp = Parser::new(tall_rows, cols, 0);
+        tmp.process(&raw);
+
+        let tmp_screen = tmp.screen();
+
+        // Find the last non-empty row to know the content height
+        let mut last_row = 0usize;
+        for r in (0..tall_rows).rev() {
+            let mut has_content = false;
+            for c in 0..cols {
+                if let Some(cell) = tmp_screen.cell(r, c) {
+                    if cell.has_contents() {
+                        has_content = true;
+                        break;
+                    }
+                }
+            }
+            if has_content {
+                last_row = r as usize + 1;
+                break;
+            }
+        }
+
+        let content_height = last_row.max(rows as usize);
+        let max_offset = content_height.saturating_sub(rows as usize);
+        let offset = self.scroll_offset.min(max_offset);
+        let start = content_height.saturating_sub(rows as usize + offset);
+
         let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows as usize);
-        for r in 0..rows {
+        for r in 0..rows as usize {
+            let actual_row = (start + r) as u16;
             let mut row: Vec<Cell> = Vec::with_capacity(cols as usize);
             for c in 0..cols {
-                let cell = screen
-                    .cell(r, c)
-                    .cloned()
-                    .unwrap_or_default();
+                let cell = if actual_row < tall_rows {
+                    tmp_screen.cell(actual_row, c).cloned().unwrap_or_default()
+                } else {
+                    Cell::default()
+                };
                 row.push(cell);
             }
             out.push(row);
         }
-
         out
     }
 
