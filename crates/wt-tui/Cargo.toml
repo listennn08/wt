@@ -1,0 +1,4 @@
+[package]
+name = "wt-tui"
+version = "1.0.0"
+edition = "2021"
