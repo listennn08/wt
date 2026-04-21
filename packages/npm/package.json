@@ -1,0 +1,13 @@
+{
+  "name": "@listennn08/wt",
+  "version": "1.0.0",
+  "description": "Git worktree manager (npm wrapper — downloads prebuilt Rust binary)",
+  "bin": {
+    "wt": "./bin/wt"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["x64", "arm64"]
+}
