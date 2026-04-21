@@ -13,14 +13,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Add a new worktree from a branch
+    Add(cmd::add::AddArgs),
     /// List all worktrees
     List(cmd::list::ListArgs),
+    /// Delete a worktree
+    #[command(alias = "rm")]
+    Remove(cmd::remove::RemoveArgs),
+    /// Switch to a worktree and open a shell in its directory
+    #[command(alias = "sw")]
+    Switch(cmd::switch::SwitchArgs),
+    /// Prune stale worktree information
+    Prune(cmd::prune::PruneArgs),
+    /// Remove wt shell completions and print uninstall instructions
+    Uninstall(cmd::uninstall::UninstallArgs),
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Add(args) => cmd::add::run(args),
         Commands::List(args) => cmd::list::run(args),
+        Commands::Remove(args) => cmd::remove::run(args),
+        Commands::Switch(args) => cmd::switch::run(args),
+        Commands::Prune(args) => cmd::prune::run(args),
+        Commands::Uninstall(args) => cmd::uninstall::run(args),
     }
 }
