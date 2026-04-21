@@ -29,6 +29,16 @@ enum Commands {
     Tui(cmd::tui::TuiArgs),
     /// Remove wt shell completions and print uninstall instructions
     Uninstall(cmd::uninstall::UninstallArgs),
+    /// Shell completion utilities
+    Completion(cmd::completion::CompletionArgs),
+
+    // Hidden completion helpers
+    #[command(name = "__complete-branches", hide = true)]
+    CompleteBranches,
+    #[command(name = "__complete-worktrees", hide = true)]
+    CompleteWorktrees,
+    #[command(name = "__complete-actions", hide = true)]
+    CompleteActions,
 }
 
 fn main() -> Result<()> {
@@ -42,5 +52,9 @@ fn main() -> Result<()> {
         Commands::Prune(args) => cmd::prune::run(args),
         Commands::Tui(args) => cmd::tui::run(args),
         Commands::Uninstall(args) => cmd::uninstall::run(args),
+        Commands::Completion(args) => cmd::completion::run(args),
+        Commands::CompleteBranches => cmd::completion::complete_branches(),
+        Commands::CompleteWorktrees => cmd::completion::complete_worktrees(),
+        Commands::CompleteActions => { cmd::completion::complete_actions(); Ok(()) }
     }
 }
