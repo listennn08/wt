@@ -41,12 +41,25 @@ pub fn run(args: ListArgs) -> Result<()> {
     Ok(())
 }
 
+// ponytail: counts chars, not display width. Good enough until someone puts a
+// wide CJK char or emoji in a branch name; reach for unicode-width if that happens.
 fn pad(s: &str, width: usize) -> String {
-    if s.len() >= width {
+    let len = s.chars().count();
+    if len >= width {
         s.to_string()
     } else {
-        format!("{}{}", s, " ".repeat(width - s.len()))
+        format!("{}{}", s, " ".repeat(width - len))
     }
+}
+
+/// Truncate from the left, keeping the tail (paths are most specific at the end).
+fn truncate_start(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width || width == 0 {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(len - (width - 1)).collect();
+    format!("…{}", tail)
 }
 
 fn print_table(worktrees: &[WorktreeInfo]) {
@@ -69,8 +82,18 @@ fn print_table(worktrees: &[WorktreeInfo]) {
         })
         .collect();
 
-    let path_width = rows.iter().map(|r| r.0.len()).max().unwrap_or(4).min(60);
-    let branch_width = rows.iter().map(|r| r.1.len()).max().unwrap_or(6).min(30);
+    let path_width = rows
+        .iter()
+        .map(|r| r.0.chars().count())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 60);
+    let branch_width = rows
+        .iter()
+        .map(|r| r.1.chars().count())
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 30);
 
     // Header
     let header = format!(
@@ -82,11 +105,7 @@ fn print_table(worktrees: &[WorktreeInfo]) {
     println!("{}", header.bold().dimmed());
 
     for (path, branch, head, flags, is_base) in &rows {
-        let p = if path.len() > path_width {
-            format!("…{}", &path[path.len() - (path_width - 1)..])
-        } else {
-            path.to_string()
-        };
+        let p = truncate_start(path, path_width);
 
         let branch_col = if branch.is_empty() {
             pad("", branch_width)
@@ -116,5 +135,23 @@ fn print_table(worktrees: &[WorktreeInfo]) {
         } else {
             println!("{}", line);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pads_and_truncates_by_chars_not_bytes() {
+        assert_eq!(pad("ab", 4), "ab  ");
+        assert_eq!(pad("中文", 4), "中文  ");
+        assert_eq!(pad("toolong", 3), "toolong");
+
+        // Would panic on a byte-index slice: each char here is 3 bytes.
+        assert_eq!(truncate_start("中文测试", 3), "…测试");
+        assert_eq!(truncate_start("/a/b/c", 4), "…b/c");
+        assert_eq!(truncate_start("short", 10), "short");
+        assert_eq!(truncate_start("x", 0), "x");
     }
 }

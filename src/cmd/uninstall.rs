@@ -1,8 +1,8 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Args;
 
 use crate::output;
@@ -19,19 +19,20 @@ pub struct UninstallArgs {
 }
 
 pub fn run(args: UninstallArgs) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
     let shell = args
         .shell
         .unwrap_or_else(detect_shell)
         .to_lowercase();
 
     match shell.as_str() {
-        "zsh" => uninstall_zsh_completion(),
-        "fish" => uninstall_fish_completion(),
-        "bash" => uninstall_bash_completion(),
+        "zsh" => uninstall_zsh_completion(&home),
+        "fish" => uninstall_fish_completion(&home),
+        "bash" => uninstall_bash_completion(&home),
         "all" => {
-            uninstall_zsh_completion();
-            uninstall_fish_completion();
-            uninstall_bash_completion();
+            uninstall_zsh_completion(&home);
+            uninstall_fish_completion(&home);
+            uninstall_bash_completion(&home);
         }
         _ => {
             eprintln!("Only zsh, fish, bash, and all are supported");
@@ -74,8 +75,7 @@ fn resolve_wt_binary() -> Option<String> {
         })
 }
 
-fn uninstall_zsh_completion() {
-    let home = dirs::home_dir().unwrap();
+fn uninstall_zsh_completion(home: &Path) {
     let completion_file = home.join(".zsh").join("completions").join("_wt");
     let zshrc = home.join(".zshrc");
 
@@ -88,8 +88,7 @@ fn uninstall_zsh_completion() {
     remove_block_from_file(&zshrc, "# wt completion start", "# wt completion end");
 }
 
-fn uninstall_fish_completion() {
-    let home = dirs::home_dir().unwrap();
+fn uninstall_fish_completion(home: &Path) {
     let completion_file = home
         .join(".config")
         .join("fish")
@@ -103,8 +102,7 @@ fn uninstall_fish_completion() {
     }
 }
 
-fn uninstall_bash_completion() {
-    let home = dirs::home_dir().unwrap();
+fn uninstall_bash_completion(home: &Path) {
     let completion_file = home.join(".bash_completion.d").join("wt");
     let bashrc = home.join(".bashrc");
 

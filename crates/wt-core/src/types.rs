@@ -22,7 +22,6 @@ pub struct AddOptions {
     pub base: Option<String>,
     pub remote: String,
     pub force: bool,
-    pub progress: bool,
 }
 
 impl Default for AddOptions {
@@ -34,7 +33,6 @@ impl Default for AddOptions {
             base: None,
             remote: "origin".to_string(),
             force: false,
-            progress: true,
         }
     }
 }

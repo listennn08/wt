@@ -23,4 +23,3 @@ dirs = "5"
 serde_json = "1"
 crossterm = "0.27"
 ratatui = "0.26"
-tokio = { version = "1", features = ["full"] }

@@ -22,13 +22,17 @@ cargo run -- <subcommand>      # run in dev
 cargo check                    # type check all crates
 ```
 
-No test suite yet.
+```bash
+cargo test                     # unit tests (parsing, formatting, hook expansion)
+```
 
 ## Architecture Notes
 
 - **Single binary**: CLI commands and TUI share `wt-core` — no duplicated git logic.
-- **CLI is synchronous**: no tokio runtime. `wt tui` initializes tokio on demand for PTY sessions.
+- **Fully synchronous**: no async runtime anywhere. The TUI drives its PTYs from reader threads.
+- **Git via subprocess**: `wt-core` shells out to `git` (notably `worktree list --porcelain`) rather than linking libgit2.
 - **Hook system**: TOML-based lifecycle hooks (`pre_create`, `post_create`) in `.wt.toml`. Variables: `${base}`, `${worktree}`, env vars `WT_BASE`, `WT_WORKTREE`, `WT_BRANCH`.
 - **Config resolution**: `.wt.toml` → `wt.toml` → `.config/wt/config.toml` → `~/.config/wt/config.toml` → `$XDG_CONFIG_HOME/wt/config.toml`.
 - **Shell completion**: hand-written scripts (zsh/bash/fish) with hidden subcommands (`__complete-branches`, `__complete-worktrees`, `__complete-actions`) for dynamic branch/worktree lookup.
-- **Distribution**: crates.io (`cargo install wt-cli`), GitHub Releases (prebuilt binaries), npm wrapper (`@listennn08/wt`).
+- **Distribution**: Homebrew tap (`Formula/wt.rb`, regenerated on release by `scripts/update-formula.sh`), crates.io (`cargo install wt-cli`), GitHub Releases (prebuilt binaries), npm wrapper (`@listennn08/wt`).
+- **Homebrew formula is generated, not hand-edited**: the release workflow computes checksums from the published tarballs and commits `Formula/wt.rb` back to `main`.

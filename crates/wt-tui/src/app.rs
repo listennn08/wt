@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use ratatui::widgets::ListState;
 use ratatui::{backend::Backend, Terminal};
 
 use wt_core::git::GitRepo;
@@ -18,11 +19,15 @@ pub struct App {
     pub repo: GitRepo,
     pub worktrees: Vec<WorktreeInfo>,
     pub selected_index: usize,
+    /// Owned by App so the list's scroll offset persists between frames.
+    pub list_state: ListState,
     pub terminal_manager: TerminalManager,
     pub terminal_sessions: HashMap<String, TerminalManager>,
     pub active_terminal_path: String,
     pub focus: Focus,
     pub base_path: String,
+    /// Branch candidates for add-modal completion, loaded when the modal opens.
+    branches: Vec<String>,
     pub should_quit: bool,
     add_modal_state: AddWorktreeModal,
     progress_overlay: Option<String>,
@@ -112,11 +117,13 @@ impl App {
             repo,
             worktrees,
             selected_index,
+            list_state: ListState::default(),
             terminal_manager,
             terminal_sessions: HashMap::new(),
             active_terminal_path,
             focus: Focus::List,
             base_path,
+            branches: Vec::new(),
             should_quit: false,
             add_modal_state: AddWorktreeModal::default(),
             progress_overlay: None,
@@ -128,28 +135,46 @@ impl App {
         })
     }
 
-    pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+    pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+        // Redraw only when something actually changed: an input event, new PTY
+        // output, or a state transition. Otherwise this loop repaints 60x/sec
+        // at idle for no reason.
+        let mut needs_redraw = true;
+        let mut last_output_version = 0u64;
+
         loop {
-            // Draw the UI
-            terminal.draw(|f| draw::<B>(f, self))?;
+            let output_version = self.terminal_manager.output_version();
+            if needs_redraw || output_version != last_output_version {
+                terminal.draw(|f| draw::<B>(f, self))?;
+                last_output_version = output_version;
+                needs_redraw = false;
+            }
 
             // If the shell exited while focused on the terminal, switch focus back
             // to the list to avoid a "dead" terminal pane capturing input.
             if self.focus == Focus::Terminal && self.terminal_manager.is_disconnected() {
                 self.focus = Focus::List;
+                needs_redraw = true;
             }
 
-            self.process_pending_action();
+            if self.process_pending_action() {
+                needs_redraw = true;
+            }
 
             // Refresh worktree list when git state changes
             if self.git_changed_rx.try_recv().is_ok() {
                 // Drain any extra pending signals
                 while self.git_changed_rx.try_recv().is_ok() {}
                 self.refresh_worktrees();
+                needs_redraw = true;
             }
 
             // Handle events
             if event::poll(Duration::from_millis(16))? {
+                // Any event can change the view; the terminal may also have been
+                // swapped out from under last_output_version by a selection change.
+                needs_redraw = true;
+                last_output_version = 0;
                 match event::read()? {
                     Event::Key(key) => {
                         // Any keypress in terminal scrollback → snap back to live
@@ -158,6 +183,7 @@ impl App {
                         }
                         self.handle_key(key.code, key.modifiers);
                     }
+                    Event::Paste(text) => self.paste(&text),
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::ScrollUp => {
                             if self.focus == Focus::Terminal {
@@ -182,7 +208,7 @@ impl App {
             }
 
             // Always keep terminal alive (even when list is focused)
-            self.terminal_manager.update().await?;
+            self.terminal_manager.update()?;
 
             if self.should_quit {
                 break;
@@ -300,12 +326,34 @@ impl App {
         }
     }
 
+    /// Bracketed paste: into the add-modal field if it is open, otherwise
+    /// straight through to the shell.
+    pub fn paste(&mut self, text: &str) {
+        if self.add_modal_state.visible {
+            if self.add_modal_state.is_submitting {
+                return;
+            }
+            // A branch name is one line; newlines would submit unpredictably.
+            for line in text.lines() {
+                self.add_modal_state.input.push_str(line);
+            }
+            self.add_modal_state.error = None;
+        } else if self.focus == Focus::Terminal {
+            self.terminal_manager.send_input(text);
+        }
+    }
+
     fn refresh_worktrees(&mut self) {
         if let Ok(wts) = worktree::list_worktrees(&self.repo) {
             self.worktrees = wts;
             if self.selected_index >= self.worktrees.len() {
                 self.selected_index = self.worktrees.len().saturating_sub(1);
             }
+            // Drop shells belonging to worktrees that no longer exist, otherwise
+            // every worktree ever visited keeps a live process until quit.
+            let live: HashSet<&str> = self.worktrees.iter().map(|wt| wt.path.as_str()).collect();
+            self.terminal_sessions
+                .retain(|path, _| live.contains(path.as_str()));
         }
     }
 
@@ -369,6 +417,7 @@ impl App {
     }
 
     fn open_add_modal(&mut self) {
+        self.branches = self.repo.list_branch_candidates().unwrap_or_default();
         self.add_modal_state.visible = true;
         self.add_modal_state.input.clear();
         self.add_modal_state.error = None;
@@ -386,19 +435,31 @@ impl App {
         if self.add_modal_state.is_submitting {
             return;
         }
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
         match key_code {
             KeyCode::Esc => self.close_add_modal(),
             KeyCode::Enter => self.submit_add_modal(),
             KeyCode::Backspace => {
                 self.add_modal_state.input.pop();
             }
+            // Complete to the longest prefix shared by every match, like a shell.
+            KeyCode::Tab => {
+                let matches = self.branch_matches();
+                if !matches.is_empty() {
+                    let completed = longest_common_prefix(&matches);
+                    if completed.len() > self.add_modal_state.input.len() {
+                        self.add_modal_state.input = completed;
+                    }
+                }
+            }
+            KeyCode::Char('u') if ctrl => self.add_modal_state.input.clear(),
+            KeyCode::Char('w') if ctrl => delete_last_word(&mut self.add_modal_state.input),
             KeyCode::Char(c) => {
-                if modifiers.contains(KeyModifiers::CONTROL) {
+                if ctrl {
                     return;
                 }
                 self.add_modal_state.input.push(c);
             }
-            KeyCode::Tab => self.add_modal_state.input.push(' '),
             _ => {}
         }
         self.add_modal_state.error = None;
@@ -419,6 +480,19 @@ impl App {
                 branch: raw_input,
             });
         }
+    }
+
+    /// Branch candidates matching what has been typed so far.
+    pub fn branch_matches(&self) -> Vec<&str> {
+        let input = self.add_modal_state.input.trim();
+        if input.is_empty() {
+            return Vec::new();
+        }
+        self.branches
+            .iter()
+            .filter(|b| b.starts_with(input) && b.as_str() != input)
+            .map(|b| b.as_str())
+            .collect()
     }
 
     pub fn add_modal(&self) -> &AddWorktreeModal {
@@ -488,65 +562,126 @@ impl App {
         }
     }
 
-    fn process_pending_action(&mut self) {
-        if let Some(action) = self.pending_action.take() {
-            match action {
-                PendingAction::AddWorktree { branch } => {
-                    let opts = AddOptions {
-                        branch: branch.clone(),
-                        progress: false,
-                        ..AddOptions::default()
-                    };
-                    match worktree::add_worktree(&self.repo, opts) {
-                        Ok(_) => {
-                            self.clear_error();
-                            self.close_add_modal();
-                            self.refresh_worktrees();
-                            if let Some(idx) = self
-                                .worktrees
-                                .iter()
-                                .position(|wt| wt.branch.as_deref() == Some(branch.as_str()))
-                            {
-                                self.selected_index = idx;
-                            }
-                            self.update_terminal_for_selection();
+    /// Returns true if an action ran (and therefore the UI needs a repaint).
+    fn process_pending_action(&mut self) -> bool {
+        let Some(action) = self.pending_action.take() else {
+            return false;
+        };
+
+        match action {
+            PendingAction::AddWorktree { branch } => {
+                let opts = AddOptions {
+                    branch: branch.clone(),
+                    ..AddOptions::default()
+                };
+                match worktree::add_worktree(&self.repo, opts) {
+                    Ok(_) => {
+                        self.clear_error();
+                        self.close_add_modal();
+                        self.refresh_worktrees();
+                        if let Some(idx) = self
+                            .worktrees
+                            .iter()
+                            .position(|wt| wt.branch.as_deref() == Some(branch.as_str()))
+                        {
+                            self.selected_index = idx;
                         }
-                        Err(err) => {
-                            self.set_error(format!("Failed to create worktree: {}", err));
-                            self.add_modal_state.error = Some(err.to_string());
-                            self.add_modal_state.is_submitting = false;
-                        }
+                        self.update_terminal_for_selection();
                     }
-                }
-                PendingAction::RemoveWorktree { path } => {
-                    let opts = wt_core::types::RemoveOptions {
-                        target: path.clone(),
-                        force: false,
-                        as_branch: false,
-                        as_path: true,
-                    };
-                    match worktree::remove_worktree(&self.repo, opts) {
-                        Ok(_) => {
-                            self.clear_error();
-                            self.refresh_worktrees();
-                        }
-                        Err(err) => {
-                            self.set_error(format!("Failed to remove worktree: {}", err));
-                        }
+                    Err(err) => {
+                        self.set_error(format!("Failed to create worktree: {}", err));
+                        self.add_modal_state.error = Some(err.to_string());
+                        self.add_modal_state.is_submitting = false;
                     }
-                },
-                PendingAction::PruneWorktrees => {
-                    let opts = wt_core::types::PruneOptions {
-                        dry_run: false,
-                        verbose: false,
-                        expire: None,
-                    };
-                    let _ = worktree::prune_worktrees(&self.repo, opts);
-                    self.refresh_worktrees();
                 }
             }
-
-            self.hide_progress_overlay();
+            PendingAction::RemoveWorktree { path } => {
+                let opts = wt_core::types::RemoveOptions {
+                    target: path.clone(),
+                    force: false,
+                    as_branch: false,
+                    as_path: true,
+                };
+                match worktree::remove_worktree(&self.repo, opts) {
+                    Ok(_) => {
+                        self.clear_error();
+                        self.refresh_worktrees();
+                    }
+                    Err(err) => {
+                        self.set_error(format!("Failed to remove worktree: {}", err));
+                    }
+                }
+            },
+            PendingAction::PruneWorktrees => {
+                let opts = wt_core::types::PruneOptions {
+                    dry_run: false,
+                    verbose: false,
+                    expire: None,
+                };
+                let _ = worktree::prune_worktrees(&self.repo, opts);
+                self.refresh_worktrees();
+            }
         }
+
+        self.hide_progress_overlay();
+        true
+    }
+}
+
+/// Longest prefix shared by every candidate.
+fn longest_common_prefix(items: &[&str]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut end = first.len();
+    for item in &items[1..] {
+        end = end.min(
+            first
+                .char_indices()
+                .zip(item.char_indices())
+                .take_while(|((_, a), (_, b))| a == b)
+                .last()
+                .map_or(0, |((i, c), _)| i + c.len_utf8()),
+        );
+    }
+    first[..end].to_string()
+}
+
+/// Delete back to the previous `/` or space — branch names are path-like.
+fn delete_last_word(input: &mut String) {
+    while input.ends_with('/') || input.ends_with(' ') {
+        input.pop();
+    }
+    while !input.is_empty() && !input.ends_with('/') && !input.ends_with(' ') {
+        input.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completes_to_the_shared_prefix() {
+        assert_eq!(longest_common_prefix(&["feat/login", "feat/logout"]), "feat/log");
+        assert_eq!(longest_common_prefix(&["only-one"]), "only-one");
+        assert_eq!(longest_common_prefix(&["abc", "xyz"]), "");
+        assert_eq!(longest_common_prefix(&[]), "");
+        // must not split a multi-byte char
+        assert_eq!(longest_common_prefix(&["功能-a", "功能-b"]), "功能-");
+    }
+
+    #[test]
+    fn deletes_one_path_segment() {
+        // The separator is kept so the next segment can be typed straight away.
+        let mut s = String::from("feature/login/form");
+        delete_last_word(&mut s);
+        assert_eq!(s, "feature/login/");
+        delete_last_word(&mut s);
+        assert_eq!(s, "feature/");
+        delete_last_word(&mut s);
+        assert_eq!(s, "");
+        delete_last_word(&mut s);
+        assert_eq!(s, "");
     }
 }

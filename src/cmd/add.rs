@@ -49,7 +49,6 @@ pub fn run(args: AddArgs) -> Result<()> {
         base: args.base,
         remote: args.remote,
         force: args.force,
-        progress,
     };
 
     let path = worktree::add_worktree(&repo, opts)?;

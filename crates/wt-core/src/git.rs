@@ -3,201 +3,129 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
-use git2::Repository;
 
 use crate::types::WorktreeInfo;
 
 pub struct GitRepo {
-    repo: Repository,
+    root: PathBuf,
 }
 
 impl GitRepo {
     pub fn open(path: &Path) -> Result<Self> {
-        let repo = Repository::discover(path)
-            .with_context(|| format!("Not a git repository: {}", path.display()))?;
-        Ok(Self { repo })
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(path)
+            .output()
+            .with_context(|| format!("Failed to run git in {}", path.display()))?;
+
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() || root.is_empty() {
+            return Err(anyhow!("Not a git repository: {}", path.display()));
+        }
+        Ok(Self {
+            root: PathBuf::from(root),
+        })
+    }
+
+    /// Run git in the repo root, erroring with stderr on a non-zero exit.
+    fn git(&self, args: &[&str]) -> Result<String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.root)
+            .output()
+            .with_context(|| format!("Failed to run git {}", args.join(" ")))?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     pub fn repo_root(&self) -> Result<PathBuf> {
-        let workdir = self
-            .repo
-            .workdir()
-            .ok_or_else(|| anyhow!("Repository has no working directory"))?;
-        Ok(workdir.to_path_buf())
+        Ok(self.root.clone())
     }
 
     pub fn repo_name(&self) -> Result<String> {
-        let root = self.repo_root()?;
-        root.file_name()
+        self.root
+            .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Cannot determine repository name"))
     }
 
     pub fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>> {
-        let base_path = self.repo_root()?;
-        let base_str = base_path.to_string_lossy().to_string();
-        let worktrees_names = self.repo.worktrees()?;
-
-        let mut result = Vec::new();
-
-        // Add base worktree
-        let (branch, head) = self.get_head_info()?;
-        result.push(WorktreeInfo {
-            path: base_str.clone(),
-            branch,
-            head,
-            is_base: true,
-            is_locked: false,
-            is_prunable: false,
-            detached: None,
+        let output = self.git(&["worktree", "list", "--porcelain"])?;
+        let mut worktrees = parse_worktree_list(&output);
+        worktrees.sort_by(|a, b| match (a.is_base, b.is_base) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.path.cmp(&b.path),
         });
-
-        for name in worktrees_names.iter().flatten() {
-            if let Ok(wt) = self.repo.find_worktree(name) {
-                let wt_path = wt.path().to_string_lossy().to_string();
-                let is_locked = matches!(
-                    wt.is_locked(),
-                    Ok(git2::WorktreeLockStatus::Locked(_))
-                );
-                let is_prunable = wt.is_prunable(None).unwrap_or(false);
-                let (branch, head) = self.get_worktree_head_info(&wt);
-                let is_base = wt_path == base_str;
-
-                result.push(WorktreeInfo {
-                    path: wt_path,
-                    branch,
-                    head,
-                    is_base,
-                    is_locked,
-                    is_prunable,
-                    detached: None,
-                });
-            }
-        }
-
-        result.sort_by(|a, b| {
-            if a.is_base {
-                std::cmp::Ordering::Less
-            } else if b.is_base {
-                std::cmp::Ordering::Greater
-            } else {
-                a.path.cmp(&b.path)
-            }
-        });
-
-        Ok(result)
-    }
-
-    fn get_head_info(&self) -> Result<(Option<String>, Option<String>)> {
-        let head = self.repo.head()?;
-        let branch = if head.is_branch() {
-            head.shorthand().map(|s| s.to_string())
-        } else {
-            None
-        };
-        let head_id = head
-            .peel_to_commit()
-            .ok()
-            .map(|c| c.id().to_string());
-        Ok((branch, head_id))
-    }
-
-    fn get_worktree_head_info(
-        &self,
-        worktree: &git2::Worktree,
-    ) -> (Option<String>, Option<String>) {
-        let wt_path = worktree.path();
-        let wt_name = wt_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        let main_path = self.repo.path().parent().unwrap_or(self.repo.path());
-        let head_path = main_path
-            .join(".git")
-            .join("worktrees")
-            .join(wt_name)
-            .join("HEAD");
-
-        let head_id = Repository::open(wt_path).ok().and_then(|r| {
-            let head = r.head().ok()?;
-            let commit = head.peel_to_commit().ok()?;
-            Some(commit.id().to_string())
-        });
-
-        if let Ok(content) = std::fs::read_to_string(&head_path) {
-            if let Some(branch) = content.trim().strip_prefix("ref: refs/heads/") {
-                return (Some(branch.to_string()), head_id);
-            }
-        }
-
-        (None, head_id)
+        Ok(worktrees)
     }
 
     pub fn branch_exists_local(&self, branch: &str) -> bool {
-        self.repo.revparse_ext(branch).is_ok()
+        // Must be an actual branch: revspec matching would also accept tags,
+        // remote refs and things like HEAD~2, which produce a detached checkout.
+        Command::new("git")
+            .args(["show-ref", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{}", branch))
+            .current_dir(&self.root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     pub fn branch_exists_remote(&self, remote: &str, branch: &str) -> Result<bool> {
-        let root = self.repo_root()?;
         let output = Command::new("git")
             .args(["ls-remote", "--heads", remote, branch])
-            .current_dir(&root)
+            .current_dir(&self.root)
             .output()
             .context("Failed to run git ls-remote")?;
-        Ok(!output.stdout.is_empty())
+        Ok(output.status.success() && !output.stdout.is_empty())
     }
 
     pub fn current_branch(&self) -> Option<String> {
-        self.repo
-            .head()
-            .ok()
-            .filter(|h| h.is_branch())
-            .and_then(|h| h.shorthand().map(|s| s.to_string()))
+        let output = Command::new("git")
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .current_dir(&self.root)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!branch.is_empty()).then_some(branch)
     }
 
     pub fn default_worktree_dir(&self, branch: &str) -> Result<PathBuf> {
-        let root = self.repo_root()?;
-        let parent = root
+        let parent = self
+            .root
             .parent()
             .ok_or_else(|| anyhow!("Cannot determine repository parent directory"))?;
         let name = self.repo_name()?;
-        let sanitized = sanitize_branch_name(branch);
-        Ok(parent.join(format!("{}_{}", name, sanitized)))
+        Ok(parent.join(format!("{}_{}", name, sanitize_branch_name(branch))))
     }
 
+    // These capture git's output rather than inheriting stdio: inherited output
+    // scribbles over the TUI's alternate screen, and the captured stderr makes
+    // for a far better error than "git worktree add failed".
     pub fn git_worktree_add(&self, args: &[&str]) -> Result<()> {
-        let root = self.repo_root()?;
-        let status = Command::new("git")
-            .arg("worktree")
-            .arg("add")
-            .args(args)
-            .current_dir(&root)
-            .status()
-            .context("Failed to run git worktree add")?;
-        if !status.success() {
-            return Err(anyhow!("git worktree add failed"));
-        }
-        Ok(())
+        let mut argv = vec!["worktree", "add"];
+        argv.extend_from_slice(args);
+        self.git(&argv).map(|_| ())
     }
 
     pub fn git_worktree_remove(&self, path: &str, force: bool) -> Result<()> {
-        let root = self.repo_root()?;
-        let mut cmd = Command::new("git");
-        cmd.args(["worktree", "remove"]);
+        let mut argv = vec!["worktree", "remove"];
         if force {
-            cmd.arg("--force");
+            argv.push("--force");
         }
-        cmd.arg(path);
-        let status = cmd
-            .current_dir(&root)
-            .status()
-            .context("Failed to run git worktree remove")?;
-        if !status.success() {
-            return Err(anyhow!("git worktree remove failed"));
-        }
-        Ok(())
+        argv.push(path);
+        self.git(&argv).map(|_| ())
     }
 
     pub fn git_worktree_prune(
@@ -206,39 +134,28 @@ impl GitRepo {
         verbose: bool,
         expire: Option<&str>,
     ) -> Result<String> {
-        let root = self.repo_root()?;
-        let mut cmd = Command::new("git");
-        cmd.args(["worktree", "prune"]);
+        let mut args: Vec<String> = vec!["worktree".into(), "prune".into()];
         if dry_run {
-            cmd.arg("--dry-run");
+            args.push("--dry-run".into());
         }
         if verbose {
-            cmd.arg("--verbose");
+            args.push("--verbose".into());
         }
         if let Some(expire) = expire {
-            cmd.arg(format!("--expire={}", expire));
+            args.push(format!("--expire={}", expire));
         }
-        let output = cmd
-            .current_dir(&root)
-            .output()
-            .context("Failed to run git worktree prune")?;
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.git(&refs)
     }
 
     pub fn list_branches(&self) -> Result<Vec<String>> {
-        let root = self.repo_root()?;
-        let output = Command::new("git")
-            .args([
-                "for-each-ref",
-                "--format=%(refname:short)",
-                "refs/heads",
-                "refs/remotes",
-            ])
-            .current_dir(&root)
-            .output()
-            .context("Failed to list branches")?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let mut branches: Vec<String> = text
+        let output = self.git(&[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ])?;
+        let mut branches: Vec<String> = output
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|b| !b.is_empty() && !b.ends_with("/HEAD"))
@@ -248,13 +165,40 @@ impl GitRepo {
         Ok(branches)
     }
 
+    /// Branch names in the form `wt add` accepts: local branches, plus remote
+    /// branches with their `<remote>/` prefix stripped (lstrip=3 drops
+    /// `refs/remotes/<remote>`, so `feature/x` survives intact).
+    pub fn list_branch_candidates(&self) -> Result<Vec<String>> {
+        let local = self.git(&["for-each-ref", "--format=%(refname:short)", "refs/heads"])?;
+        let remote = self.git(&["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes"])?;
+
+        let mut names: Vec<String> = local
+            .lines()
+            .chain(remote.lines())
+            .map(|l| l.trim().to_string())
+            .filter(|b| !b.is_empty() && b != "HEAD")
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     pub fn list_worktree_paths(&self) -> Result<Vec<String>> {
-        let worktrees = self.list_worktrees()?;
-        Ok(worktrees
+        Ok(self
+            .list_worktrees()?
             .into_iter()
             .filter(|wt| !wt.is_base)
             .map(|wt| wt.path)
             .collect())
+    }
+
+    /// Path of the worktree currently checking out `branch`, if any.
+    pub fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+        Ok(self
+            .list_worktrees()?
+            .into_iter()
+            .find(|wt| wt.branch.as_deref() == Some(branch))
+            .map(|wt| PathBuf::from(wt.path)))
     }
 
     pub fn resolve_worktree_path(&self, target: &str) -> Result<Option<PathBuf>> {
@@ -263,13 +207,8 @@ impl GitRepo {
             return Ok(Some(as_path.canonicalize().unwrap_or(as_path.to_path_buf())));
         }
 
-        let worktrees = self.list_worktrees()?;
-        for wt in &worktrees {
-            if let Some(branch) = &wt.branch {
-                if branch == target {
-                    return Ok(Some(PathBuf::from(&wt.path)));
-                }
-            }
+        if let Some(path) = self.worktree_path_for_branch(target)? {
+            return Ok(Some(path));
         }
 
         let fallback = self.default_worktree_dir(target)?;
@@ -281,9 +220,118 @@ impl GitRepo {
     }
 }
 
+/// Parse `git worktree list --porcelain`. The first entry is the main worktree.
+pub fn parse_worktree_list(output: &str) -> Vec<WorktreeInfo> {
+    let mut result: Vec<WorktreeInfo> = Vec::new();
+    let mut current: Option<WorktreeInfo> = None;
+
+    for line in output.lines() {
+        let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+        match key {
+            "worktree" => {
+                if let Some(wt) = current.take() {
+                    result.push(wt);
+                }
+                current = Some(WorktreeInfo {
+                    path: value.to_string(),
+                    branch: None,
+                    head: None,
+                    is_base: result.is_empty(),
+                    is_locked: false,
+                    is_prunable: false,
+                    detached: None,
+                });
+            }
+            "HEAD" => {
+                if let Some(wt) = current.as_mut() {
+                    wt.head = Some(value.to_string());
+                }
+            }
+            "branch" => {
+                if let Some(wt) = current.as_mut() {
+                    wt.branch =
+                        Some(value.strip_prefix("refs/heads/").unwrap_or(value).to_string());
+                }
+            }
+            "detached" => {
+                if let Some(wt) = current.as_mut() {
+                    wt.detached = Some(true);
+                }
+            }
+            "locked" => {
+                if let Some(wt) = current.as_mut() {
+                    wt.is_locked = true;
+                }
+            }
+            "prunable" => {
+                if let Some(wt) = current.as_mut() {
+                    wt.is_prunable = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(wt) = current {
+        result.push(wt);
+    }
+    result
+}
+
 pub fn sanitize_branch_name(branch: &str) -> String {
     branch
         .trim()
         .replace(|c: char| c.is_whitespace(), "-")
         .replace(['/', '\\'], "-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PORCELAIN: &str = "\
+worktree /repo
+HEAD aaaa1111
+branch refs/heads/main
+
+worktree /repo_feat
+HEAD bbbb2222
+branch refs/heads/feature/x
+locked
+
+worktree /repo_detached
+HEAD cccc3333
+detached
+prunable gitdir file points to non-existent location
+";
+
+    #[test]
+    fn parses_porcelain_output() {
+        let wts = parse_worktree_list(PORCELAIN);
+        assert_eq!(wts.len(), 3);
+
+        assert_eq!(wts[0].path, "/repo");
+        assert_eq!(wts[0].branch.as_deref(), Some("main"));
+        assert_eq!(wts[0].head.as_deref(), Some("aaaa1111"));
+        assert!(wts[0].is_base);
+
+        // Branch names keep their slashes; only the refs/heads/ prefix is stripped.
+        assert_eq!(wts[1].branch.as_deref(), Some("feature/x"));
+        assert!(wts[1].is_locked);
+        assert!(!wts[1].is_base);
+
+        assert_eq!(wts[2].branch, None);
+        assert_eq!(wts[2].detached, Some(true));
+        assert!(wts[2].is_prunable);
+    }
+
+    #[test]
+    fn parses_empty_output() {
+        assert!(parse_worktree_list("").is_empty());
+    }
+
+    #[test]
+    fn sanitizes_branch_names() {
+        assert_eq!(sanitize_branch_name(" feat/a b "), "feat-a-b");
+        assert_eq!(sanitize_branch_name("plain"), "plain");
+    }
 }

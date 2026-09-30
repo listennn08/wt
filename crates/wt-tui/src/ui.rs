@@ -11,10 +11,13 @@ use crate::app::{App, Focus};
 use vt100::Color as VtColor;
 
 fn truncate_with_ellipsis(input: &str, max_len: usize) -> String {
-    if input.len() <= max_len {
+    // Count chars, not bytes: a byte-index slice panics mid-UTF8 on a branch
+    // name or path containing non-ASCII.
+    if input.chars().count() <= max_len {
         input.to_string()
     } else if max_len > 1 {
-        format!("{}…", &input[..max_len - 1])
+        let head: String = input.chars().take(max_len - 1).collect();
+        format!("{}…", head)
     } else {
         "…".to_string()
     }
@@ -30,6 +33,7 @@ pub fn draw<B: Backend>(f: &mut Frame, app: &mut App) {
             Constraint::Length(1),     // Title
             Constraint::Min(10),       // Content
             Constraint::Length(2),     // Status
+            Constraint::Length(1),     // Key hints
         ])
         .split(size);
 
@@ -45,12 +49,22 @@ pub fn draw<B: Backend>(f: &mut Frame, app: &mut App) {
     // Status bar
     draw_status::<B>(f, app, chunks[2]);
 
+    // Key hints
+    draw_hints::<B>(f, app, chunks[3]);
+
     if let Some(msg) = app.progress_overlay() {
         draw_progress_overlay::<B>(f, msg);
     }
 
     if let Some(message) = app.confirm_message() {
         draw_confirm_dialog::<B>(f, message);
+    }
+
+    // Errors were being stored and never shown: the operation just appeared to
+    // do nothing, and the next keypress got swallowed dismissing the invisible
+    // message.
+    if let Some(message) = app.error_message() {
+        draw_error_dialog::<B>(f, message);
     }
 
     if app.add_modal_visible() {
@@ -81,118 +95,77 @@ fn draw_content<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_worktrees_list<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
     const MAX_BRANCH_LEN: usize = 24;
 
-    let row_data: Vec<_> = app
+    let rows: Vec<(String, String, String)> = app
         .worktrees
         .iter()
-        .enumerate()
-        .filter_map(|(idx, wt)| {
-            let branch = wt.branch.as_ref()?;
-            let branch = truncate_with_ellipsis(branch, MAX_BRANCH_LEN);
-
-            let head = wt
-                .head
-                .as_ref()
-                .map(|head| {
-                    if head.len() > 8 {
-                        head[..8].to_string()
-                    } else {
-                        head.clone()
-                    }
-                })
-                .unwrap_or_default();
-
-            let flags = {
-                let mut flags = vec![];
-                if wt.is_base {
-                    flags.push("base");
-                }
-                if wt.is_locked {
-                    flags.push("locked");
-                }
-                if wt.is_prunable {
-                    flags.push("prunable");
-                }
-                if flags.is_empty() {
-                    String::new()
-                } else {
-                    format!("[{}]", flags.join(","))
-                }
+        .map(|wt| {
+            // Every worktree gets a row. Skipping the branch-less ones used to
+            // desync this list from selected_index, which indexes app.worktrees.
+            let branch = match wt.branch.as_deref() {
+                Some(branch) => truncate_with_ellipsis(branch, MAX_BRANCH_LEN),
+                None if wt.detached == Some(true) => "(detached)".to_string(),
+                None => "(no branch)".to_string(),
             };
 
-            Some((idx, branch, head, flags))
+            let head: String = wt
+                .head
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .take(8)
+                .collect();
+
+            let mut flags = vec![];
+            if wt.is_base {
+                flags.push("base");
+            }
+            if wt.is_locked {
+                flags.push("locked");
+            }
+            if wt.is_prunable {
+                flags.push("prunable");
+            }
+            let flags = if flags.is_empty() {
+                String::new()
+            } else {
+                format!("[{}]", flags.join(","))
+            };
+
+            (branch, head, flags)
         })
         .collect();
 
-    if row_data.is_empty() {
-        let list = List::new(Vec::<ListItem>::new())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Worktrees")
-                    .border_style(Style::default().fg(Color::White)),
-            )
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-        f.render_widget(list, area);
-        return;
-    }
-
-    let branch_width = row_data
+    let branch_width = rows
         .iter()
-        .map(|(_, branch, _, _)| branch.len())
+        .map(|(branch, _, _)| branch.chars().count())
         .max()
         .unwrap_or(0);
-    let head_width = row_data
+    let head_width = rows
         .iter()
-        .map(|(_, _, head, _)| head.len())
-        .max()
-        .unwrap_or(0);
-    let flags_width = row_data
-        .iter()
-        .map(|(_, _, _, flags)| flags.len())
+        .map(|(_, head, _)| head.chars().count())
         .max()
         .unwrap_or(0);
 
-    let items: Vec<ListItem> = row_data
+    let items: Vec<ListItem> = rows
         .iter()
-        .map(|(idx, branch, head, flags)| {
-            let mut style = Style::default();
-            if *idx == app.selected_index {
-                style = style.fg(Color::Cyan);
-            }
-
-            let mut content = vec![];
-            if *idx == app.selected_index {
-                content.push(Span::styled("> ", Style::default().fg(Color::Cyan)));
-            } else {
-                content.push(Span::raw("  "));
-            }
-
-            let branch_display = if branch_width > 0 {
-                format!("{:<width$}", branch, width = branch_width)
-            } else {
-                branch.clone()
-            };
-            content.push(Span::styled(branch_display, Style::default().fg(Color::Cyan)));
-
+        .map(|(branch, head, flags)| {
+            let mut content = vec![Span::styled(
+                format!("{:<width$}", branch, width = branch_width),
+                Style::default().fg(Color::Cyan),
+            )];
             if head_width > 0 {
-                let head_display = format!(
-                    "  {:<width$}",
-                    if head.is_empty() { "" } else { head },
-                    width = head_width
-                );
-                content.push(Span::styled(head_display, Style::default().fg(Color::Yellow)));
+                content.push(Span::styled(
+                    format!("  {:<width$}", head, width = head_width),
+                    Style::default().fg(Color::Yellow),
+                ));
             }
-
-            if flags_width > 0 {
-                let flags_display = if flags.is_empty() {
-                    " ".repeat(flags_width + 2)
-                } else {
-                    format!("  {:<width$}", flags, width = flags_width)
-                };
-                content.push(Span::styled(flags_display, Style::default().fg(Color::Magenta)));
+            if !flags.is_empty() {
+                content.push(Span::styled(
+                    format!("  {}", flags),
+                    Style::default().fg(Color::Magenta),
+                ));
             }
-
-            ListItem::new(Line::from(content)).style(style)
+            ListItem::new(Line::from(content))
         })
         .collect();
 
@@ -200,12 +173,21 @@ fn draw_worktrees_list<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Worktrees")
+                .title(format!("Worktrees ({})", app.worktrees.len()))
                 .border_style(Style::default().fg(Color::White)),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        // A stateful list scrolls to keep the selection on screen; the old
+        // stateless render just clipped everything past the pane height.
+        .highlight_symbol("> ")
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
 
-    f.render_widget(list, area);
+    let selected = (!app.worktrees.is_empty()).then_some(app.selected_index);
+    app.list_state.select(selected);
+    f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
 fn draw_terminal<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
@@ -319,11 +301,30 @@ fn draw_terminal<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
         display_lines.push(Line::from(spans));
     }
 
+    let label = app
+        .worktrees
+        .get(app.selected_index)
+        .map(|wt| match wt.branch.as_deref() {
+            Some(branch) => branch.to_string(),
+            None => std::path::Path::new(&wt.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| wt.path.clone()),
+        })
+        .unwrap_or_default();
+    let title = if app.terminal_manager.is_scrolled_back() {
+        format!("Terminal — {} ↑ scrollback", label)
+    } else if label.is_empty() {
+        "Terminal".to_string()
+    } else {
+        format!("Terminal — {}", label)
+    };
+
     let paragraph = Paragraph::new(display_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Terminal")
+                .title(title)
                 .border_style(Style::default().fg(if app.focus == Focus::Terminal {
                     Color::Cyan
                 } else {
@@ -452,6 +453,92 @@ fn draw_status<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(status, area);
 }
 
+/// Bottom key hints. Modals draw their own, so this only covers the two
+/// focus modes.
+fn draw_hints<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
+    let hints: &[(&str, &str)] = if app.focus == Focus::Terminal {
+        if app.terminal_manager.is_scrolled_back() {
+            &[("esc", "list"), ("any key", "back to live")]
+        } else {
+            &[
+                ("esc", "list"),
+                ("^r", "restart shell"),
+                ("scroll", "history"),
+            ]
+        }
+    } else {
+        &[
+            ("↑↓", "move"),
+            ("⏎", "terminal"),
+            ("a", "add"),
+            ("r", "remove"),
+            ("x", "prune"),
+            ("g", "refresh"),
+            ("R", "restart"),
+            ("q", "quit"),
+        ]
+    };
+
+    let key_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(Color::DarkGray);
+
+    let mut spans = Vec::with_capacity(hints.len() * 4);
+    for (i, (key, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", label_style));
+        }
+        spans.push(Span::styled(*key, key_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(*label, label_style));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_error_dialog<B: Backend>(f: &mut Frame, message: &str) {
+    let area = f.size();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Length(9),
+            Constraint::Percentage(30),
+        ])
+        .split(area);
+
+    let modal_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Fill(1),
+            Constraint::Percentage(15),
+        ])
+        .split(vertical[1])[1];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(Color::Black))
+        .title("Error");
+
+    let paragraph = Paragraph::new(vec![
+        Line::from(Span::styled(
+            message.trim().to_string(),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(" "),
+        Line::from(Span::styled(
+            "press any key to dismiss",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+    .wrap(Wrap { trim: true })
+    .block(block);
+
+    f.render_widget(Clear, modal_area);
+    f.render_widget(paragraph, modal_area);
+}
+
 fn draw_add_worktree_modal<B: Backend>(f: &mut Frame, app: &mut App) {
     let area = f.size();
     let vertical = Layout::default()
@@ -472,6 +559,9 @@ fn draw_add_worktree_modal<B: Backend>(f: &mut Frame, app: &mut App) {
         ])
         .split(vertical[1])[1];
 
+    let inner_width = modal_area.width.saturating_sub(2) as usize;
+    let matches = app.branch_matches();
+    let match_count = matches.len();
     let modal = app.add_modal();
     let mut lines = Vec::new();
 
@@ -497,31 +587,37 @@ fn draw_add_worktree_modal<B: Backend>(f: &mut Frame, app: &mut App) {
 
         if let Some(err) = &modal.error {
             const MAX_ERR_LEN: usize = 80;
-            let display_err = if err.len() > MAX_ERR_LEN {
-                format!("{}…", &err[..MAX_ERR_LEN - 1])
-            } else {
-                err.clone()
-            };
             lines.push(Line::from(Span::styled(
-                display_err,
+                truncate_with_ellipsis(err, MAX_ERR_LEN),
                 Style::default().fg(Color::LightRed),
             )));
-        } else {
-            // Reserve vertical space even when no error is present so the hint
-            // always appears at the same position.
+        } else if match_count == 0 {
             lines.push(Line::from(" "));
+        } else {
+            // Kept to a single line: wrapping would push the hint out of the modal.
+            let shown = truncate_with_ellipsis(&matches.join("  "), inner_width);
+            lines.push(Line::from(Span::styled(
+                shown,
+                Style::default().fg(Color::DarkGray),
+            )));
         }
 
         lines.push(Line::from(" "));
         lines.push(Line::from(Span::styled(
-            "Enter to create · Esc to cancel",
+            "Enter create · Tab complete · ^w del word · ^u clear · Esc cancel",
             Style::default().fg(Color::Gray),
         )));
     }
     // always leave hint at bottom
 
+    let title = if match_count > 0 && modal.error.is_none() && !modal.is_submitting {
+        format!("Add Worktree ({} matches)", match_count)
+    } else {
+        "Add Worktree".to_string()
+    };
+
     let block = Block::default()
-        .title("Add Worktree")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(Color::Black));

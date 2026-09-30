@@ -1,12 +1,16 @@
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::Result;
 use portable_pty::{CommandBuilder, PtyPair, PtySize, PtySystem};
-use vt100::Parser;
 use vt100::Cell;
+use vt100::Parser;
+
+/// Lines of terminal history kept per session.
+const SCROLLBACK_LINES: usize = 1000;
 
 pub struct TerminalManager {
     pty_system: Box<dyn PtySystem + Send>,
@@ -17,29 +21,29 @@ pub struct TerminalManager {
     parser: Arc<Mutex<Parser>>,
     is_alive: Arc<Mutex<bool>>,
     disconnected: Arc<Mutex<bool>>,
-    /// Raw output bytes accumulated from PTY (for scrollback re-rendering)
-    raw_output: Arc<Mutex<Vec<u8>>>,
-    /// Scroll offset (0 = live view, >0 = scrolled back)
-    scroll_offset: usize,
+    /// Bumped whenever the screen contents change, so the UI can skip redraws.
+    output_version: Arc<AtomicU64>,
 }
 
 impl TerminalManager {
     pub fn new() -> Result<Self> {
-        let pty_system = portable_pty::native_pty_system();
-        let parser = Parser::new(24, 80, 1000);
-
         Ok(Self {
-            pty_system,
+            pty_system: portable_pty::native_pty_system(),
             pty_pair: None,
             child_process: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
-            current_dir: Arc::new(Mutex::new(std::env::current_dir()?.to_string_lossy().to_string())),
-            parser: Arc::new(Mutex::new(parser)),
+            current_dir: Arc::new(Mutex::new(
+                std::env::current_dir()?.to_string_lossy().to_string(),
+            )),
+            parser: Arc::new(Mutex::new(Parser::new(24, 80, SCROLLBACK_LINES))),
             is_alive: Arc::new(Mutex::new(false)),
             disconnected: Arc::new(Mutex::new(false)),
-            raw_output: Arc::new(Mutex::new(Vec::new())),
-            scroll_offset: 0,
+            output_version: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    pub fn output_version(&self) -> u64 {
+        self.output_version.load(Ordering::Relaxed)
     }
 
     pub fn is_disconnected(&self) -> bool {
@@ -62,7 +66,7 @@ impl TerminalManager {
     }
 
     pub fn send_input(&mut self, input: &str) {
-        self.scroll_offset = 0;
+        self.set_scroll(0);
         let mut guard = self.writer.lock().unwrap();
         if let Some(writer) = guard.as_mut() {
             let _ = writer.write_all(input.as_bytes());
@@ -70,19 +74,30 @@ impl TerminalManager {
         }
     }
 
+    /// Current scrollback offset. vt100 clamps this to the history it actually
+    /// holds, so it is the single source of truth rather than a mirrored field.
+    fn scroll_offset(&self) -> usize {
+        self.parser.lock().unwrap().screen().scrollback()
+    }
+
+    fn set_scroll(&self, rows: usize) {
+        self.parser.lock().unwrap().set_scrollback(rows);
+        self.output_version.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn scroll_up(&mut self, lines: usize) {
-        self.scroll_offset += lines;
+        self.set_scroll(self.scroll_offset().saturating_add(lines));
     }
 
     pub fn scroll_down(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.set_scroll(self.scroll_offset().saturating_sub(lines));
     }
 
     pub fn is_scrolled_back(&self) -> bool {
-        self.scroll_offset > 0
+        self.scroll_offset() > 0
     }
 
-    pub async fn update(&mut self) -> Result<()> {
+    pub fn update(&mut self) -> Result<()> {
         // Start terminal if not alive
         if !*self.is_alive.lock().unwrap() {
             // If the user exited the shell, keep the terminal disconnected until
@@ -107,10 +122,7 @@ impl TerminalManager {
             pixel_height: 0,
         })?;
 
-        {
-            let mut parser = self.parser.lock().unwrap();
-            parser.set_size(24, 80);
-        }
+        self.parser.lock().unwrap().set_size(24, 80);
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let mut cmd = CommandBuilder::new(&shell);
@@ -129,10 +141,7 @@ impl TerminalManager {
         let child = pty_pair.slave.spawn_command(cmd)?;
 
         // Store child so we can manage lifecycle (and allow a watcher thread to wait).
-        {
-            let mut guard = self.child_process.lock().unwrap();
-            *guard = Some(child);
-        }
+        *self.child_process.lock().unwrap() = Some(child);
 
         *self.is_alive.lock().unwrap() = true;
         *self.disconnected.lock().unwrap() = false;
@@ -145,11 +154,9 @@ impl TerminalManager {
             let writer = self.writer.clone();
             let disconnected = self.disconnected.clone();
             let parser = self.parser.clone();
+            let version = self.output_version.clone();
             thread::spawn(move || {
-                let child = {
-                    let mut guard = child_process.lock().unwrap();
-                    guard.take()
-                };
+                let child = child_process.lock().unwrap().take();
                 if let Some(mut child) = child {
                     let _ = child.wait();
                 }
@@ -162,91 +169,28 @@ impl TerminalManager {
                 if let Ok(mut p) = parser.lock() {
                     p.process(b"\r\n[Shell exited. Press Ctrl+R (or Shift+R in list) to restart]\r\n");
                 }
+                version.fetch_add(1, Ordering::Relaxed);
             });
         }
 
         // Take the writer ONCE and store it.
-        {
-            let mut guard = self.writer.lock().unwrap();
-            *guard = Some(pty_pair.master.take_writer()?);
-        }
+        *self.writer.lock().unwrap() = Some(pty_pair.master.take_writer()?);
 
         let mut reader = pty_pair.master.try_clone_reader()?;
         let parser = self.parser.clone();
-        let raw_output = self.raw_output.clone();
+        let version = self.output_version.clone();
 
-        // Reader thread to capture output
+        // Reader thread to capture output. vt100 is a full terminal parser, so
+        // escape sequences (OSC included) are consumed here, not hand-stripped.
         thread::spawn(move || {
-            #[derive(Debug, Clone, Copy)]
-            enum ParseState {
-                Normal,
-                Esc,
-                Osc,
-                OscEsc,
-            }
-
-            // Strip OSC sequences (ESC ] ... BEL) or (ESC ] ... ESC \\)
-            // These are often emitted by shell integration (e.g. iTerm2) and
-            // show up as noisy text in a non-ANSI-aware renderer.
-            fn strip_osc(bytes: &[u8], state: &mut ParseState) -> Vec<u8> {
-                let mut out = Vec::with_capacity(bytes.len());
-                for &b in bytes {
-                    match *state {
-                        ParseState::Normal => {
-                            if b == 0x1b {
-                                *state = ParseState::Esc;
-                            } else {
-                                out.push(b);
-                            }
-                        }
-                        ParseState::Esc => {
-                            if b == b']' {
-                                *state = ParseState::Osc;
-                            } else {
-                                // Not an OSC sequence; keep ESC + this byte.
-                                out.push(0x1b);
-                                out.push(b);
-                                *state = ParseState::Normal;
-                            }
-                        }
-                        ParseState::Osc => {
-                            if b == 0x07 {
-                                // BEL terminator
-                                *state = ParseState::Normal;
-                            } else if b == 0x1b {
-                                // Might be ESC \\ terminator
-                                *state = ParseState::OscEsc;
-                            }
-                        }
-                        ParseState::OscEsc => {
-                            if b == b'\\' {
-                                // ESC \\ terminator
-                                *state = ParseState::Normal;
-                            } else {
-                                // Still inside OSC; keep consuming.
-                                *state = ParseState::Osc;
-                            }
-                        }
-                    }
-                }
-                out
-            }
-
-            let mut state = ParseState::Normal;
-            let mut buf = [0u8; 1024];
+            let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break, // EOF
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let cleaned = strip_osc(&buf[..n], &mut state);
-                        if cleaned.is_empty() {
-                            continue;
-                        }
-                        raw_output.lock().unwrap().extend_from_slice(&cleaned);
-                        let mut parser = parser.lock().unwrap();
-                        parser.process(&cleaned);
+                        parser.lock().unwrap().process(&buf[..n]);
+                        version.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(_) => break,
                 }
             }
         });
@@ -256,122 +200,25 @@ impl TerminalManager {
         Ok(())
     }
 
-    pub fn get_screen_lines(&self, rows: u16, cols: u16) -> Vec<String> {
-        let mut parser = self.parser.lock().unwrap();
-        parser.set_size(rows, cols);
-
-        let text = parser.screen().contents();
-        let mut lines: Vec<String> = text
-            .lines()
-            .map(|l| {
-                let mut s = l.to_string();
-                if s.chars().count() > cols as usize {
-                    s = s.chars().take(cols as usize).collect();
-                }
-                s
-            })
-            .collect();
-
-        if lines.len() > rows as usize {
-            lines = lines[lines.len().saturating_sub(rows as usize)..].to_vec();
-        }
-
-        while lines.len() < rows as usize {
-            lines.insert(0, String::new());
-        }
-
-        lines
-    }
-
     pub fn get_screen_cells(&self, rows: u16, cols: u16) -> Vec<Vec<Cell>> {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         let mut parser = self.parser.lock().unwrap();
         parser.set_size(rows, cols);
 
-        if self.scroll_offset == 0 {
-            // Live view — just return visible screen
-            let screen = parser.screen();
-            let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows as usize);
-            for r in 0..rows {
-                let mut row: Vec<Cell> = Vec::with_capacity(cols as usize);
-                for c in 0..cols {
-                    let cell = screen.cell(r, c).cloned().unwrap_or_default();
-                    row.push(cell);
-                }
-                out.push(row);
-            }
-            return out;
-        }
-
-        // Scrollback view — re-render all raw output into a tall virtual terminal,
-        // then pick a window offset from the bottom.
-        let raw = self.raw_output.lock().unwrap();
-        if raw.is_empty() {
-            // Nothing to scroll back to
-            let screen = parser.screen();
-            let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows as usize);
-            for r in 0..rows {
-                let mut row: Vec<Cell> = Vec::with_capacity(cols as usize);
-                for c in 0..cols {
-                    let cell = screen.cell(r, c).cloned().unwrap_or_default();
-                    row.push(cell);
-                }
-                out.push(row);
-            }
-            return out;
-        }
-
-        // Use a large virtual terminal to hold all output
-        let tall_rows = 5000u16; // max scrollback lines
-        let mut tmp = Parser::new(tall_rows, cols, 0);
-        tmp.process(&raw);
-
-        let tmp_screen = tmp.screen();
-
-        // Find the last non-empty row to know the content height
-        let mut last_row = 0usize;
-        for r in (0..tall_rows).rev() {
-            let mut has_content = false;
-            for c in 0..cols {
-                if let Some(cell) = tmp_screen.cell(r, c) {
-                    if cell.has_contents() {
-                        has_content = true;
-                        break;
-                    }
-                }
-            }
-            if has_content {
-                last_row = r as usize + 1;
-                break;
-            }
-        }
-
-        let content_height = last_row.max(rows as usize);
-        let max_offset = content_height.saturating_sub(rows as usize);
-        let offset = self.scroll_offset.min(max_offset);
-        let start = content_height.saturating_sub(rows as usize + offset);
-
-        let mut out: Vec<Vec<Cell>> = Vec::with_capacity(rows as usize);
-        for r in 0..rows as usize {
-            let actual_row = (start + r) as u16;
-            let mut row: Vec<Cell> = Vec::with_capacity(cols as usize);
-            for c in 0..cols {
-                let cell = if actual_row < tall_rows {
-                    tmp_screen.cell(actual_row, c).cloned().unwrap_or_default()
-                } else {
-                    Cell::default()
-                };
-                row.push(cell);
-            }
-            out.push(row);
-        }
-        out
-    }
-
-    pub fn is_alive(&self) -> bool {
-        *self.is_alive.lock().unwrap()
+        // set_scrollback has already shifted the view, so the visible screen is
+        // either the live one or the scrolled-back window.
+        let screen = parser.screen();
+        (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| screen.cell(r, c).cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect()
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         if let Some(ref pty_pair) = self.pty_pair {
             let _ = pty_pair.master.resize(PtySize {
                 rows,
@@ -380,8 +227,6 @@ impl TerminalManager {
                 pixel_height: 0,
             });
         }
-
-        let mut parser = self.parser.lock().unwrap();
-        parser.set_size(rows, cols);
+        self.parser.lock().unwrap().set_size(rows, cols);
     }
 }

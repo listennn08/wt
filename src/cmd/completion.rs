@@ -1,6 +1,6 @@
 use std::fs;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Args, Subcommand};
 use wt_core::git::GitRepo;
 
@@ -95,7 +95,7 @@ fn detect_shell() -> String {
 }
 
 fn install_zsh() -> Result<()> {
-    let home = dirs::home_dir().unwrap();
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
     let dir = home.join(".zsh").join("completions");
     let file = dir.join("_wt");
     let zshrc = home.join(".zshrc");
@@ -128,7 +128,7 @@ fn install_zsh() -> Result<()> {
 }
 
 fn install_fish() -> Result<()> {
-    let home = dirs::home_dir().unwrap();
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
     let dir = home.join(".config").join("fish").join("completions");
     let file = dir.join("wt.fish");
 
@@ -141,7 +141,7 @@ fn install_fish() -> Result<()> {
 }
 
 fn install_bash() -> Result<()> {
-    let home = dirs::home_dir().unwrap();
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
     let dir = home.join(".bash_completion.d");
     let file = dir.join("wt");
     let bashrc = home.join(".bashrc");

@@ -25,12 +25,7 @@ pub fn add_worktree(repo: &GitRepo, opts: AddOptions) -> Result<PathBuf> {
         branch: &opts.branch,
     };
 
-    // Pre-create hooks
-    if let Some(pre) = add_hooks.and_then(|h| h.pre_create.as_ref()) {
-        run_hooks("hooks.add.pre_create", pre, &hook_ctx)?;
-    }
-
-    // Check target exists
+    // Check the target before running hooks, so a doomed create has no side effects.
     if worktree_path.exists() && !opts.force {
         return Err(anyhow!(
             "Target path already exists: {}\nUse --force to proceed.",
@@ -38,15 +33,18 @@ pub fn add_worktree(repo: &GitRepo, opts: AddOptions) -> Result<PathBuf> {
         ));
     }
 
+    // Pre-create hooks
+    if let Some(pre) = add_hooks.and_then(|h| h.pre_create.as_ref()) {
+        run_hooks("hooks.add.pre_create", pre, &hook_ctx)?;
+    }
+
     let wt_str = worktree_path.to_string_lossy().to_string();
 
-    // Determine which git worktree add variant to use
-    let local_exists = repo.branch_exists_local(&opts.branch);
-    let remote_exists = repo.branch_exists_remote(&opts.remote, &opts.branch)?;
-
-    if local_exists {
+    // Determine which git worktree add variant to use. The remote is only
+    // consulted when the branch is missing locally — no network hit otherwise.
+    if repo.branch_exists_local(&opts.branch) {
         repo.git_worktree_add(&[&wt_str, &opts.branch])?;
-    } else if remote_exists && !opts.new_branch {
+    } else if !opts.new_branch && repo.branch_exists_remote(&opts.remote, &opts.branch)? {
         let remote_ref = format!("{}/{}", opts.remote, opts.branch);
         repo.git_worktree_add(&["-b", &opts.branch, &wt_str, &remote_ref])?;
     } else {
@@ -77,6 +75,8 @@ pub fn remove_worktree(repo: &GitRepo, opts: RemoveOptions) -> Result<PathBuf> {
     let resolved = if opts.as_path {
         let p = std::path::Path::new(&opts.target);
         Some(p.canonicalize().unwrap_or(p.to_path_buf()))
+    } else if opts.as_branch {
+        repo.worktree_path_for_branch(&opts.target)?
     } else {
         repo.resolve_worktree_path(&opts.target)?
     };

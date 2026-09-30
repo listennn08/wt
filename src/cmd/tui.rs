@@ -2,7 +2,9 @@ use std::io;
 
 use anyhow::Result;
 use clap::Args;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -20,24 +22,24 @@ pub struct TuiArgs {
 }
 
 pub fn run(args: TuiArgs) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
-        let mut app = App::new(&args.repo)?;
-        let res = app.run(&mut terminal).await;
+    // Never `?` before the terminal is restored, or a failure leaves the user's
+    // shell in raw mode on the alternate screen.
+    let res = App::new(&args.repo).and_then(|mut app| app.run(&mut terminal));
 
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-        terminal.show_cursor()?;
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
+    terminal.show_cursor()?;
 
-        if let Err(err) = res {
-            eprintln!("Error: {:?}", err);
-        }
-        Ok(())
-    })
+    res
 }

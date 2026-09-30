@@ -34,6 +34,9 @@ pub fn run(args: SwitchArgs) -> Result<()> {
     let resolved = if args.path {
         let p = Path::new(&args.target);
         p.canonicalize().unwrap_or(p.to_path_buf())
+    } else if args.branch {
+        repo.worktree_path_for_branch(&args.target)?
+            .ok_or_else(|| anyhow!("No worktree checks out branch: {}", args.target))?
     } else {
         worktree::resolve_switch_target(&repo, &args.target)?
     };
