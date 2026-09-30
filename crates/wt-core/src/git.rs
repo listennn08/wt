@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::types::WorktreeInfo;
 
+#[derive(Clone)]
 pub struct GitRepo {
     root: PathBuf,
 }

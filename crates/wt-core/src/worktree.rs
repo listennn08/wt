@@ -23,6 +23,7 @@ pub fn add_worktree(repo: &GitRepo, opts: AddOptions) -> Result<PathBuf> {
         base_top: &base_top,
         worktree_path: &worktree_path,
         branch: &opts.branch,
+        capture_output: opts.capture_hook_output,
     };
 
     // Check the target before running hooks, so a doomed create has no side effects.

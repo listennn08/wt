@@ -22,6 +22,9 @@ pub struct AddOptions {
     pub base: Option<String>,
     pub remote: String,
     pub force: bool,
+    /// Capture hook output instead of inheriting stdio — needed under a TUI,
+    /// where inherited output draws over the screen.
+    pub capture_hook_output: bool,
 }
 
 impl Default for AddOptions {
@@ -33,6 +36,7 @@ impl Default for AddOptions {
             base: None,
             remote: "origin".to_string(),
             force: false,
+            capture_hook_output: false,
         }
     }
 }

@@ -36,6 +36,9 @@ pub struct App {
     confirm_dialog: Option<ConfirmDialog>,
     _watcher: Option<RecommendedWatcher>,
     git_changed_rx: mpsc::Receiver<()>,
+    /// Set while an add runs off-thread; hooks like `pnpm install` would
+    /// otherwise freeze every pane until they finish.
+    add_result_rx: Option<mpsc::Receiver<(String, Result<PathBuf>)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +135,7 @@ impl App {
             confirm_dialog: None,
             _watcher: watcher,
             git_changed_rx: rx,
+            add_result_rx: None,
         })
     }
 
@@ -157,7 +161,7 @@ impl App {
                 needs_redraw = true;
             }
 
-            if self.process_pending_action() {
+            if self.process_pending_action() || self.poll_add_result() {
                 needs_redraw = true;
             }
 
@@ -533,30 +537,19 @@ impl App {
 
         match action {
             PendingAction::AddWorktree { branch } => {
-                let opts = AddOptions {
-                    branch: branch.clone(),
-                    ..AddOptions::default()
-                };
-                match worktree::add_worktree(&self.repo, opts) {
-                    Ok(_) => {
-                        self.clear_error();
-                        self.close_add_modal();
-                        self.refresh_worktrees();
-                        if let Some(idx) = self
-                            .worktrees
-                            .iter()
-                            .position(|wt| wt.branch.as_deref() == Some(branch.as_str()))
-                        {
-                            self.selected_index = idx;
-                        }
-                        self.update_terminal_for_selection();
-                    }
-                    Err(err) => {
-                        self.set_error(format!("Failed to create worktree: {}", err));
-                        self.add_modal_state.error = Some(err.to_string());
-                        self.add_modal_state.is_submitting = false;
-                    }
-                }
+                let (tx, rx) = mpsc::channel();
+                let repo = self.repo.clone();
+                std::thread::spawn(move || {
+                    let opts = AddOptions {
+                        branch: branch.clone(),
+                        capture_hook_output: true,
+                        ..AddOptions::default()
+                    };
+                    let _ = tx.send((branch, worktree::add_worktree(&repo, opts)));
+                });
+                self.add_result_rx = Some(rx);
+                // The overlay stays up until poll_add_result sees the outcome.
+                return true;
             }
             PendingAction::RemoveWorktree { path } => {
                 let opts = wt_core::types::RemoveOptions {
@@ -587,6 +580,45 @@ impl App {
         }
 
         self.hide_progress_overlay();
+        true
+    }
+}
+
+impl App {
+    /// Returns true once a background add has finished and been applied.
+    fn poll_add_result(&mut self) -> bool {
+        let Some(rx) = &self.add_result_rx else {
+            return false;
+        };
+        let (branch, result) = match rx.try_recv() {
+            Ok(done) => done,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                (String::new(), Err(anyhow::anyhow!("worktree add thread panicked")))
+            }
+        };
+        self.add_result_rx = None;
+        self.hide_progress_overlay();
+        match result {
+            Ok(_) => {
+                self.clear_error();
+                self.close_add_modal();
+                self.refresh_worktrees();
+                if let Some(idx) = self
+                    .worktrees
+                    .iter()
+                    .position(|wt| wt.branch.as_deref() == Some(branch.as_str()))
+                {
+                    self.selected_index = idx;
+                }
+                self.update_terminal_for_selection();
+            }
+            Err(err) => {
+                self.set_error(format!("Failed to create worktree: {}", err));
+                self.add_modal_state.error = Some(err.to_string());
+                self.add_modal_state.is_submitting = false;
+            }
+        }
         true
     }
 }
