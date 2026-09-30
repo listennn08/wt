@@ -109,6 +109,10 @@ impl TerminalManager {
         self.set_scroll(self.scroll_offset().saturating_sub(lines));
     }
 
+    pub fn application_cursor(&self) -> bool {
+        self.parser.lock().unwrap().screen().application_cursor()
+    }
+
     pub fn is_scrolled_back(&self) -> bool {
         self.scroll_offset() > 0
     }
@@ -189,7 +193,7 @@ impl TerminalManager {
                 // Best-effort message into the terminal buffer so the user knows
                 // what happened and how to recover.
                 if let Ok(mut p) = parser.lock() {
-                    p.process(b"\r\n[Shell exited. Press Ctrl+R (or Shift+R in list) to restart]\r\n");
+                    p.process(b"\r\n[Shell exited. Press R in the list to restart]\r\n");
                 }
                 version.fetch_add(1, Ordering::Relaxed);
             });

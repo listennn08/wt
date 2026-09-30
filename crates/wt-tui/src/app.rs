@@ -276,53 +276,16 @@ impl App {
         }
     }
 
+    /// Ctrl+T is the only key the pane keeps; everything else — Esc for vim,
+    /// Ctrl+R for history search — belongs to the shell.
     fn handle_terminal_key(&mut self, key_code: KeyCode, modifiers: KeyModifiers) {
-        match key_code {
-            KeyCode::Esc => self.focus = Focus::List,
-            KeyCode::BackTab => self.focus = Focus::List,
-            KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => self.focus = Focus::List,
-            KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.terminal_manager.restart();
-            }
-            _ => {
-                // Send key to terminal
-                if let Some(input) = self.key_to_ansi(key_code, modifiers) {
-                    self.terminal_manager.send_input(&input);
-                }
-            }
+        if key_code == KeyCode::Char('t') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.focus = Focus::List;
+            return;
         }
-    }
-
-
-
-    fn key_to_ansi(&self, key_code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
-        match key_code {
-            KeyCode::Enter => Some("\r".to_string()),
-            KeyCode::Backspace => Some("\x7f".to_string()),
-            KeyCode::Delete => Some("\x1b[3~".to_string()),
-            KeyCode::Tab => Some("\t".to_string()),
-            KeyCode::Esc => Some("\x1b".to_string()),
-            KeyCode::Up => Some("\x1b[A".to_string()),
-            KeyCode::Down => Some("\x1b[B".to_string()),
-            KeyCode::Right => Some("\x1b[C".to_string()),
-            KeyCode::Left => Some("\x1b[D".to_string()),
-            KeyCode::Home => Some("\x1b[H".to_string()),
-            KeyCode::End => Some("\x1b[F".to_string()),
-            KeyCode::PageUp => Some("\x1b[5~".to_string()),
-            KeyCode::PageDown => Some("\x1b[6~".to_string()),
-            KeyCode::Char(c) => {
-                if modifiers.contains(KeyModifiers::CONTROL) {
-                    // Ctrl+key
-                    if c.is_ascii_lowercase() {
-                        Some(((c as u8 - b'a' + 1) as char).to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    Some(c.to_string())
-                }
-            }
-            _ => None,
+        let app_cursor = self.terminal_manager.application_cursor();
+        if let Some(input) = key_to_ansi(key_code, modifiers, app_cursor) {
+            self.terminal_manager.send_input(&input);
         }
     }
 
@@ -628,6 +591,58 @@ impl App {
     }
 }
 
+/// Bytes an xterm sends for a key. `app_cursor` is DECCKM, which full-screen
+/// programs like vim and less switch on to get `ESC O` arrows.
+fn key_to_ansi(key_code: KeyCode, modifiers: KeyModifiers, app_cursor: bool) -> Option<String> {
+    let arrow = |c: char| {
+        if app_cursor { format!("\x1bO{}", c) } else { format!("\x1b[{}", c) }
+    };
+    let seq = match key_code {
+        KeyCode::Enter => "\r".to_string(),
+        KeyCode::Backspace => "\x7f".to_string(),
+        KeyCode::Delete => "\x1b[3~".to_string(),
+        KeyCode::Insert => "\x1b[2~".to_string(),
+        KeyCode::Tab => "\t".to_string(),
+        KeyCode::BackTab => "\x1b[Z".to_string(),
+        KeyCode::Esc => "\x1b".to_string(),
+        KeyCode::Up => arrow('A'),
+        KeyCode::Down => arrow('B'),
+        KeyCode::Right => arrow('C'),
+        KeyCode::Left => arrow('D'),
+        KeyCode::Home => arrow('H'),
+        KeyCode::End => arrow('F'),
+        KeyCode::PageUp => "\x1b[5~".to_string(),
+        KeyCode::PageDown => "\x1b[6~".to_string(),
+        KeyCode::F(n @ 1..=4) => format!("\x1bO{}", (b'P' + n - 1) as char),
+        KeyCode::F(n @ 5..=12) => {
+            const CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+            format!("\x1b[{}~", CODES[(n - 5) as usize])
+        }
+        KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
+            let byte = match c.to_ascii_lowercase() {
+                c @ 'a'..='z' => c as u8 - b'a' + 1,
+                '@' | ' ' | '2' => 0,
+                '[' | '3' => 0x1b,
+                '\\' | '4' => 0x1c,
+                ']' | '5' => 0x1d,
+                '^' | '6' => 0x1e,
+                '_' | '-' | '7' => 0x1f,
+                '8' | '?' => 0x7f,
+                _ => return None,
+            };
+            (byte as char).to_string()
+        }
+        KeyCode::Char(c) => c.to_string(),
+        _ => return None,
+    };
+    // Alt sends ESC first (meta-sends-escape), which readline and zle read as Meta.
+    if modifiers.contains(KeyModifiers::ALT) {
+        Some(format!("\x1b{}", seq))
+    } else {
+        Some(seq)
+    }
+}
+
 /// Longest prefix shared by every candidate.
 fn longest_common_prefix(items: &[&str]) -> String {
     let Some(first) = items.first() else {
@@ -669,6 +684,23 @@ mod tests {
         assert_eq!(longest_common_prefix(&[]), "");
         // must not split a multi-byte char
         assert_eq!(longest_common_prefix(&["功能-a", "功能-b"]), "功能-");
+    }
+
+    #[test]
+    fn forwards_shell_keys_as_xterm_does() {
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        let key = |k, m| key_to_ansi(k, m, false);
+        assert_eq!(key(KeyCode::Esc, none).as_deref(), Some("\x1b"));
+        assert_eq!(key(KeyCode::Char('r'), ctrl).as_deref(), Some("\x12"));
+        assert_eq!(key(KeyCode::Char('R'), ctrl).as_deref(), Some("\x12"));
+        assert_eq!(key(KeyCode::Char('['), ctrl).as_deref(), Some("\x1b"));
+        assert_eq!(key(KeyCode::Char('b'), KeyModifiers::ALT).as_deref(), Some("\x1bb"));
+        assert_eq!(key(KeyCode::BackTab, KeyModifiers::SHIFT).as_deref(), Some("\x1b[Z"));
+        assert_eq!(key(KeyCode::F(1), none).as_deref(), Some("\x1bOP"));
+        assert_eq!(key(KeyCode::F(12), none).as_deref(), Some("\x1b[24~"));
+        assert_eq!(key(KeyCode::Up, none).as_deref(), Some("\x1b[A"));
+        assert_eq!(key_to_ansi(KeyCode::Up, none, true).as_deref(), Some("\x1bOA"));
     }
 
     #[test]

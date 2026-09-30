@@ -136,9 +136,12 @@ around.
 
 | Key | Action |
 |---|---|
-| `Esc` / `Shift+Tab` / `Ctrl+T` | Back to the list |
-| `Ctrl+R` | Restart the shell |
+| `Ctrl+T` | Back to the list |
 | Scroll | Scroll back through history |
+
+Every other key goes to the shell — `Esc` for vim, `Ctrl+R` for history
+search, `Alt` combinations for word movement. When the shell exits, focus
+returns to the list; `R` there starts a new one.
 
 **Add-worktree prompt** (`a`)
 

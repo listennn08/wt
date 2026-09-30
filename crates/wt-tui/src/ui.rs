@@ -458,11 +458,10 @@ fn draw_status<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_hints<B: Backend>(f: &mut Frame, app: &mut App, area: Rect) {
     let hints: &[(&str, &str)] = if app.focus == Focus::Terminal {
         if app.terminal_manager.is_scrolled_back() {
-            &[("esc", "list"), ("any key", "back to live")]
+            &[("^t", "list"), ("any key", "back to live")]
         } else {
             &[
-                ("esc", "list"),
-                ("^r", "restart shell"),
+                ("^t", "list"),
                 ("scroll", "history"),
             ]
         }
