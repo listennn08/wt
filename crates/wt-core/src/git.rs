@@ -11,20 +11,28 @@ pub struct GitRepo {
 }
 
 impl GitRepo {
+    /// Opens the repo rooted at its main worktree, even when `path` is inside a
+    /// linked worktree — new worktrees, config, and env files all hang off it.
     pub fn open(path: &Path) -> Result<Self> {
         let output = Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "--show-toplevel",
+            ])
             .current_dir(path)
             .output()
             .with_context(|| format!("Failed to run git in {}", path.display()))?;
 
-        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !output.status.success() || root.is_empty() {
-            return Err(anyhow!("Not a git repository: {}", path.display()));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut lines = stdout.lines().map(str::trim);
+        match (output.status.success(), lines.next(), lines.next()) {
+            (true, Some(common_dir), Some(toplevel)) if !toplevel.is_empty() => Ok(Self {
+                root: main_worktree_root(Path::new(common_dir), Path::new(toplevel)),
+            }),
+            _ => Err(anyhow!("Not a git repository: {}", path.display())),
         }
-        Ok(Self {
-            root: PathBuf::from(root),
-        })
     }
 
     /// Run git in the repo root, erroring with stderr on a non-zero exit.
@@ -277,6 +285,15 @@ pub fn parse_worktree_list(output: &str) -> Vec<WorktreeInfo> {
     result
 }
 
+/// The common dir is `<main>/.git` for a normal repo; anything else (a bare
+/// repo, a custom GIT_DIR) has no main checkout to point at, so keep toplevel.
+fn main_worktree_root(common_dir: &Path, toplevel: &Path) -> PathBuf {
+    match common_dir.parent() {
+        Some(parent) if common_dir.file_name().is_some_and(|n| n == ".git") => parent.to_path_buf(),
+        _ => toplevel.to_path_buf(),
+    }
+}
+
 pub fn sanitize_branch_name(branch: &str) -> String {
     branch
         .trim()
@@ -327,6 +344,24 @@ prunable gitdir file points to non-existent location
     #[test]
     fn parses_empty_output() {
         assert!(parse_worktree_list("").is_empty());
+    }
+
+    #[test]
+    fn opens_linked_worktree_at_main_root() {
+        let tmp = std::env::temp_dir().join(format!("wt-open-{}", std::process::id()));
+        let main = tmp.join("app");
+        let linked = tmp.join("app_feat");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(Command::new("git").args(args).current_dir(dir).status().unwrap().success());
+        };
+        git(&main, &["init", "-q"]);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "i"]);
+        git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+
+        let repo = GitRepo::open(&linked).unwrap();
+        assert_eq!(repo.root.canonicalize().unwrap(), main.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
